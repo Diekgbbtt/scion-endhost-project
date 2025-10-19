@@ -13,9 +13,14 @@ import (
 
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/daemon"
+	"github.com/scionproto/scion/pkg/experimental/fabrid"
+	fabridcommon "github.com/scionproto/scion/pkg/experimental/fabrid/common"
 	"github.com/scionproto/scion/pkg/log"
 	"github.com/scionproto/scion/pkg/private/serrors"
+	"github.com/scionproto/scion/pkg/slayers"
+	"github.com/scionproto/scion/pkg/slayers/extension"
 	"github.com/scionproto/scion/pkg/snet"
+	"github.com/scionproto/scion/pkg/snet/path"
 
 	"gitlab.inf.ethz.ch/PRV-PERRIG/netsec-course/project-scion/lib"
 )
@@ -26,6 +31,8 @@ var local string
 
 // The remote SCION address of the verifier application.
 var remote snet.UDPAddr
+
+var daemonConnectorGlobal daemon.Connector
 
 // The port of your SCION daemon.
 const daemonPort = 30255
@@ -72,6 +79,7 @@ func test1(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIA
 	}
 
 	// send crafted packer with write and listen for replies from teh verifier
+	log.Debug("about to write packet", "SCION datagram", send_packet)
 	err := sPktConn.WriteTo(&send_packet, pathToVer.UnderlayNextHop())
 	if err != nil {
 		return serrors.WrapStr("sending scion msg to verifier", err)
@@ -646,19 +654,200 @@ func test11(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 	return nil
 }
 
-func test20(sPktConn snet.PacketConn, dstIP netip.Addr, srcIP netip.Addr, localIAAddr addr.IA, hiddenPaths []snet.Path, publicPaths []snet.Path) error {
+func findHiddenPathsSupportingEPIC(hiddenPaths []snet.Path) []snet.Path {
+
+	// check that hiddenPaths isn't empty
+	// looop through all paths : if both _path.Metadata().EpicAuths.AuthLHVF and _path.Metadata().EpicAuths.AuthPHVF are not nil path support EPIC
+	// add to returning list and return it
+	var epicPaths []snet.Path
+	if len(hiddenPaths) == 0 {
+		return epicPaths
+	}
+	for _, hiddenPath := range hiddenPaths {
+		metadata := hiddenPath.Metadata()
+		if metadata == nil {
+			continue
+		}
+		if metadata.EpicAuths.SupportsEpic() {
+			epicPaths = append(epicPaths, hiddenPath)
+		}
+	}
+	return epicPaths
+
+}
+
+type fabridCandidate struct {
+	path              snet.Path
+	hops              []snet.HopInterface
+	supportsPolicy    bool
+	matchedPolicyIDs  []*fabrid.PolicyID
+	fallbackPolicyIDs []*fabrid.PolicyID
+	fingerprint       snet.PathFingerprint
+}
+
+func newPolicyIDPtr(id fabrid.PolicyID) *fabrid.PolicyID {
+	p := id
+	return &p
+}
+
+func normalizePolicyString(policy string) string {
+	trimmed := strings.TrimSpace(policy)
+	if trimmed == "" {
+		return ""
+	}
+	return strings.ToUpper(trimmed)
+}
+
+func mergeUniquePaths(slices ...[]snet.Path) []snet.Path {
+	seen := make(map[snet.PathFingerprint]struct{})
+	var merged []snet.Path
+	for _, slice := range slices {
+		for _, p := range slice {
+			if p == nil {
+				continue
+			}
+			fp := snet.Fingerprint(p)
+			if _, ok := seen[fp]; ok {
+				continue
+			}
+			seen[fp] = struct{}{}
+			merged = append(merged, p)
+		}
+	}
+	return merged
+}
+
+func buildFabridCandidates(paths []snet.Path, requiredPolicies []string) []*fabridCandidate {
+	requiredSet := make(map[string]struct{})
+	for _, policy := range requiredPolicies {
+		normalized := normalizePolicyString(policy)
+		if normalized != "" {
+			requiredSet[normalized] = struct{}{}
+		}
+	}
+	requirementActive := len(requiredSet) > 0
+
+	var candidates []*fabridCandidate
+	for _, p := range paths {
+		if p == nil {
+			continue
+		}
+		meta := p.Metadata()
+		if meta == nil {
+			continue
+		}
+		hops := meta.Hops()
+		if len(hops) == 0 {
+			continue
+		}
+		fallbackIDs := make([]*fabrid.PolicyID, len(hops))
+		matchedIDs := make([]*fabrid.PolicyID, len(hops))
+		hasFabrid := false
+		supports := true
+
+		for i, hop := range hops {
+			if !hop.FabridEnabled {
+				continue
+			}
+			hasFabrid = true
+
+			if len(hop.Policies) > 0 {
+				fallbackIDs[i] = newPolicyIDPtr(hop.Policies[0].Index)
+			} else {
+				fallbackIDs[i] = newPolicyIDPtr(fabrid.PolicyID(0))
+			}
+
+			if !requirementActive {
+				continue
+			}
+			if !supports {
+				continue
+			}
+			hopMatch := false
+			for _, pol := range hop.Policies {
+				if pol == nil {
+					continue
+				}
+				if _, ok := requiredSet[normalizePolicyString(pol.String())]; ok {
+					matchedIDs[i] = newPolicyIDPtr(pol.Index)
+					hopMatch = true
+					break
+				}
+			}
+			if !hopMatch {
+				supports = false
+			}
+		}
+		if !hasFabrid {
+			continue
+		}
+		candidate := &fabridCandidate{
+			path:              p,
+			hops:              hops,
+			supportsPolicy:    supports || !requirementActive,
+			fallbackPolicyIDs: fallbackIDs,
+			fingerprint:       snet.Fingerprint(p),
+		}
+		if requirementActive && supports {
+			candidate.matchedPolicyIDs = matchedIDs
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates
+}
+
+func chooseBestFabridCandidate(candidates []*fabridCandidate, requireSupport bool) *fabridCandidate {
+	if len(candidates) == 0 {
+		return nil
+	}
+	var filtered []*fabridCandidate
+	for _, candidate := range candidates {
+		if !requireSupport || candidate.supportsPolicy {
+			filtered = append(filtered, candidate)
+		}
+	}
+	if len(filtered) == 0 {
+		if requireSupport {
+			return chooseBestFabridCandidate(candidates, false)
+		}
+		return nil
+	}
+	pathOptions := make([]snet.Path, len(filtered))
+	for i, candidate := range filtered {
+		pathOptions[i] = candidate.path
+	}
+	shortestPaths := findShortestPaths(pathOptions)
+	var chosenPath snet.Path
+	switch len(shortestPaths) {
+	case 0:
+		chosenPath = filtered[0].path
+	case 1:
+		chosenPath = shortestPaths[0]
+	default:
+		chosenPath = findLexicographicLowestIntfIdsPath(shortestPaths)
+	}
+	targetFingerprint := snet.Fingerprint(chosenPath)
+	for _, candidate := range filtered {
+		if candidate.fingerprint == targetFingerprint {
+			return candidate
+		}
+	}
+	return filtered[0]
+}
+
+func test20(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, hiddenPaths []snet.Path, publicPaths []snet.Path) error {
 
 	var _path snet.Path = nil
 	var paths []snet.Path = nil
 	var send_packet snet.Packet
 
-	hiddenPaths = nil
+	hiddenPathsEPIC := findHiddenPathsSupportingEPIC(hiddenPaths)
 
 	// check if paths is not empty, we assume always at least 1 public path available
-	if len(hiddenPaths) == 0 {
+	if len(hiddenPathsEPIC) == 0 {
 		paths = publicPaths
 	} else {
-		paths = hiddenPaths
+		paths = hiddenPathsEPIC
 	}
 
 	// if more than one find shortest path, lower number of interfaces
@@ -676,16 +865,13 @@ func test20(sPktConn snet.PacketConn, dstIP netip.Addr, srcIP netip.Addr, localI
 
 	payloadBytes := []byte(`{"ID": 20,"Payload": {}}`)
 
-	if len(hiddenPaths) != 0 {
-		// auths := snet.EpicAuths{
-		// 	AuthPHVF: make([]byte, 16),
-		// 	AuthLHVF: make([]byte, 16),
-		// }
-		// // extend dataplane with EPIC dataplane
-		// epicPath, err := path.NewEPICDataplanePath(_path.Dataplane().(path.SCION), auths)
-		// if err != nil {
-		// 	return serrors.WrapStr("creating EPIC dataplane path", err)
-		// }
+	if len(hiddenPathsEPIC) != 0 {
+
+		// extend dataplane with EPIC dataplane
+		epicPath, err := path.NewEPICDataplanePath(_path.Dataplane().(path.SCION), snet.EpicAuths{AuthPHVF: _path.Metadata().EpicAuths.AuthPHVF, AuthLHVF: _path.Metadata().EpicAuths.AuthLHVF})
+		if err != nil {
+			return serrors.WrapStr("creating EPIC dataplane path", err)
+		}
 		send_packet = snet.Packet{
 			PacketInfo: snet.PacketInfo{
 				Source: snet.SCIONAddress{
@@ -696,7 +882,7 @@ func test20(sPktConn snet.PacketConn, dstIP netip.Addr, srcIP netip.Addr, localI
 					IA:   remote.IA,
 					Host: addr.HostIP(dstIP),
 				},
-				Path:    _path.Dataplane(),
+				Path:    epicPath,
 				Payload: snet.UDPPayload{DstPort: uint16(remote.Host.Port), SrcPort: uint16(sPktConn.LocalAddr().(*net.UDPAddr).Port), Payload: payloadBytes},
 				// spktConn.OpenRaw() opens a socket listening on the specified address, though the dispatcher(daemon) opens a random port
 			},
@@ -722,11 +908,11 @@ func test20(sPktConn snet.PacketConn, dstIP netip.Addr, srcIP netip.Addr, localI
 	}
 
 	log.Debug("sending over", "path", _path)
-	log.Debug("port source in packer", "srcport", sPktConn.LocalAddr().(*net.UDPAddr).Port)
+	log.Debug("port source in packet", "srcport", sPktConn.LocalAddr().(*net.UDPAddr).Port)
 	log.Debug("next hop in the path", "next hop", _path.UnderlayNextHop())
 
 	// send crafted packer with write and listen for replies from teh verifier
-	log.Debug("about to write packet")
+	log.Debug("about to write packet", "SCION datagram", send_packet)
 	err := sPktConn.WriteTo(&send_packet, _path.UnderlayNextHop())
 	if err != nil {
 		return serrors.WrapStr("sending scion msg to verifier", err)
@@ -753,11 +939,169 @@ func test20(sPktConn snet.PacketConn, dstIP netip.Addr, srcIP netip.Addr, localI
 	// TODO edit debgu log to printout test execiution result
 	log.Debug("Verifier reply UDPPayload", "payload", string(replyPayload))
 
-	// overwrite remote dst dataplane path
-	// remote.Path = pathsToVerIA[0].Dataplane()
-	// craft new EPIC-supporting packet
+	return nil
+
+}
+
+// 30-31-32-33 require to satisfy a FABRID policy specified by the verifier
+
+func test30(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, publicPaths []snet.Path) error {
+	if daemonConnectorGlobal == nil {
+		return serrors.New("daemon connector is not initialized")
+	}
+	if len(publicPaths) == 0 {
+		return serrors.New("no paths available for FABRID connectivity test")
+	}
+
+	candidates := buildFabridCandidates(publicPaths, nil)
+	selectedCandidate := chooseBestFabridCandidate(candidates, true)
+	if selectedCandidate == nil {
+		selectedCandidate = chooseBestFabridCandidate(candidates, false)
+	}
+
+	selectedPath := publicPaths[0]
+	if selectedCandidate != nil {
+		selectedPath = selectedCandidate.path
+	}
+	if selectedPath == nil {
+		return serrors.New("unable to select path for FABRID connectivity test")
+	}
+
+	var (
+		nextHop         = selectedPath.UnderlayNextHop()
+		dataplanePath   = selectedPath.Dataplane()
+		fabridPath      *path.FABRID
+		policyFulfilled bool
+	)
+
+	if selectedCandidate != nil {
+		scionDataplane, ok := selectedCandidate.path.Dataplane().(path.SCION)
+		if !ok {
+			log.Debug("Selected path does not expose SCION dataplane for FABRID",
+				"type", fmt.Sprintf("%T", selectedCandidate.path.Dataplane()))
+		} else {
+			fabridCfg := &path.FabridConfig{
+				LocalIA:         localIAAddr,
+				LocalAddr:       srcIP.String(),
+				DestinationIA:   remote.IA,
+				DestinationAddr: dstIP.String(),
+				ValidationRatio: 128,
+			}
+			fabridCfg.ValidationHandler = func(ps *fabridcommon.PathState, opt *extension.FabridControlOption, success bool) error {
+				if !success {
+					log.Info("FABRID validation reported failure", "stats", ps.Stats, "optionType", opt.Type)
+				} else {
+					log.Debug("FABRID validation succeeded", "stats", ps.Stats)
+				}
+				return nil
+			}
+			policiesToUse := selectedCandidate.fallbackPolicyIDs
+			fPath, err := path.NewFABRIDDataplanePath(scionDataplane, selectedCandidate.hops, policiesToUse, fabridCfg, daemonConnectorGlobal.FabridKeys)
+			if err != nil {
+				log.Debug("Failed to build FABRID dataplane path", "err", err)
+			} else {
+				fabridPath = fPath
+				dataplanePath = fPath
+				policyFulfilled = true
+			}
+		}
+	}
+
+	testPayload := lib.Test{
+		ID:      lib.FabridConnectivityTest,
+		Payload: policyFulfilled,
+	}
+	payloadBytes, err := json.Marshal(testPayload)
+	if err != nil {
+		return serrors.WrapStr("encoding FABRID connectivity payload", err)
+	}
+
+	finalPacket := snet.Packet{
+		PacketInfo: snet.PacketInfo{
+			Source: snet.SCIONAddress{
+				IA:   localIAAddr,
+				Host: addr.HostIP(srcIP),
+			},
+			Destination: snet.SCIONAddress{
+				IA:   remote.IA,
+				Host: addr.HostIP(dstIP),
+			},
+			Path:    dataplanePath,
+			Payload: snet.UDPPayload{DstPort: uint16(remote.Host.Port), SrcPort: uint16(sPktConn.LocalAddr().(*net.UDPAddr).Port), Payload: payloadBytes},
+		},
+	}
+	if err := sPktConn.WriteTo(&finalPacket, nextHop); err != nil {
+		return serrors.WrapStr("sending FABRID connectivity result", err)
+	}
+
+	var response snet.Packet
+	var responseUnderlay net.UDPAddr
+	if err := sPktConn.ReadFrom(&response, &responseUnderlay); err != nil {
+		return serrors.WrapStr("reading FABRID connectivity response", err)
+	}
+
+	if fabridPath != nil && response.E2eExtension != nil {
+		for _, opt := range response.E2eExtension.Options {
+			if opt.OptType != slayers.OptTypeFabridControl {
+				continue
+			}
+			controlOption, err := extension.ParseFabridControlOption(opt)
+			if err != nil {
+				return serrors.WrapStr("parsing FABRID control option", err)
+			}
+			if err := fabridPath.HandleFabridControlOption(controlOption, nil); err != nil {
+				return serrors.WrapStr("handling FABRID control option", err)
+			}
+		}
+	}
+
+	var finalPayload []byte
+	if udpPayload, ok := response.Payload.(snet.UDPPayload); ok {
+		finalPayload = udpPayload.Payload
+		log.Debug("FABRID verifier reply", "payload", string(finalPayload))
+	} else {
+		log.Debug("FABRID verifier reply not UDP", "type", fmt.Sprintf("%T", response.Payload))
+	}
+
+	if len(finalPayload) > 0 {
+		var result lib.TestResult
+		if err := json.Unmarshal(finalPayload, &result); err == nil && result.ID == lib.FabridConnectivityTest {
+			if result.State == lib.TestFailed {
+				return serrors.New("FABRID connectivity test reported failure")
+			}
+		}
+	}
 
 	return nil
+}
+
+/*
+ALL POSSIBLE POLICIES
+
+- L1000: Route only over routers produced by manufacturer A
+- L1001: Route only over routers produced by manufacturer B
+- L1002: Route only over routers produced by manufacturer C
+- L2000: Route only over routers that support remote attestation
+*/
+
+// For this test you have to find a FABRID policy that restricts paths to only route over routers that are either manufactured by manufacturer A or manufacturer B.
+func test31(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, publicPaths []snet.Path) error {
+
+}
+
+/*
+For this test you have to find a FABRID policy that that restricts paths where all routers in ISD 1 are manufactured by manufacturer A and all routers in ISD 2 are manufactured by manufacturer B or C.
+If only one ISD has to be traversed, the policies of the other ISD do not matter.
+*/
+func test32(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, publicPaths []snet.Path) error {
+
+}
+
+/*
+For this test you have to route over routers that support remote attestation. If an intermediate hop does not support remote attestation, you can route over any routers produced by manufacturer C, but the last hop to the destination must support remote attestation
+Additionally, do not enforce any policies for the local AS.
+*/
+func test33(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, publicPaths []snet.Path) error {
 
 }
 
@@ -783,6 +1127,8 @@ func realMain() error {
 	if err != nil {
 		return serrors.WrapStr("connecting to daemon", err)
 	}
+	daemonConnectorGlobal = daemonConnector
+	defer daemonConnector.Close()
 
 	// get Local IA address
 	localIAAddr, err := daemonConnector.LocalIA(ctx)
@@ -805,7 +1151,7 @@ func realMain() error {
 	}
 
 	// obtain available hidden paths from daemon for the verifier AS
-	hiddenPaths, err := daemonConnector.Paths(ctx, remote.IA, localAddr.IA, daemon.PathReqFlags{Hidden: true})
+	hiddenPaths, err := daemonConnector.Paths(ctx, remote.IA, localIAAddr, daemon.PathReqFlags{Hidden: true})
 	if err != nil {
 		return serrors.WrapStr("getting hidden paths from daemon to verifier AS", err)
 	}
@@ -820,7 +1166,12 @@ func realMain() error {
 	}
 
 	// TODO runtime debugging due to IDE misinterpretation for all paths print type of Bandwidth and Latency values and all their values
-	log.Debug("Paths to verifier IA", "count", len(pathsToVerIA))
+	log.Debug("Public Paths to verifier IA", "count", len(pathsToVerIA))
+	for i, path := range pathsToVerIA {
+		pathMeta := path.Metadata()
+		log.Debug("Path", "index", i, "path", pathMeta)
+	}
+	log.Debug("Hidden Paths to verifier IA", "count", len(pathsToVerIA))
 	for i, path := range pathsToVerIA {
 		pathMeta := path.Metadata()
 		log.Debug("Path", "index", i, "path", pathMeta)
@@ -852,7 +1203,7 @@ func realMain() error {
 	}
 
 	// establish connection with the verifier
-	// TODO check if I should set ReplyPatcher and SCMPhandler too.
+	// TODO set ReplyPatcher and SCMPhandler too.
 	scionNetwork := &snet.SCIONNetwork{Topology: daemonConnector}
 	spktConn, err := scionNetwork.OpenRaw(ctx, localAddr.Host)
 	if err != nil {
@@ -894,6 +1245,22 @@ func realMain() error {
 		return serrors.WrapStr("failed test 11, due to :s", err)
 	}
 	err = test20(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, hiddenPaths, pathsToVerIA)
+	if err != nil {
+		return serrors.WrapStr("failed test 20, due to :s", err)
+	}
+	err = test30(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, pathsToVerIA)
+	if err != nil {
+		return serrors.WrapStr("failed test 20, due to :s", err)
+	}
+	err = test31(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, pathsToVerIA)
+	if err != nil {
+		return serrors.WrapStr("failed test 20, due to :s", err)
+	}
+	err = test32(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, pathsToVerIA)
+	if err != nil {
+		return serrors.WrapStr("failed test 20, due to :s", err)
+	}
+	err = test33(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, pathsToVerIA)
 	if err != nil {
 		return serrors.WrapStr("failed test 20, due to :s", err)
 	}
