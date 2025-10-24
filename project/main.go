@@ -797,6 +797,92 @@ func buildFabridCandidates(paths []snet.Path, requiredPolicies []string) []*fabr
 	return candidates
 }
 
+// buildFabridCandidatesTest32 evaluates paths for the manufacturer-per-ISD policy used in test32.
+// A path complies if every hop that resides in ISD 1 advertises policy L1000 (manufacturer A)
+// and every hop in ISD 2 advertises either L1001 or L1002 (manufacturers B or C). Paths that
+// do not traverse one of the targeted ISDs are still considered valid as long as the traversed
+// ISDs satisfy their respective constraints. The function returns candidates annotated with the
+// hop-by-hop policy choices that a FABRID dataplane path should enforce.
+func buildFabridCandidatesTest32(paths []snet.Path) []*fabridCandidate {
+	type policySet []string
+	requiredByISD := map[addr.ISD]policySet{
+		addr.ISD(1): {"L1000"},
+		addr.ISD(2): {"L1001", "L1002"},
+	}
+
+	var candidates []*fabridCandidate
+	for _, p := range paths {
+		if p == nil {
+			continue
+		}
+		meta := p.Metadata()
+		if meta == nil {
+			continue
+		}
+		hops := meta.Hops()
+		if len(hops) == 0 {
+			continue
+		}
+
+		fallbackIDs := make([]*fabrid.PolicyID, len(hops))
+		matchedIDs := make([]*fabrid.PolicyID, len(hops))
+		hasFabrid := false
+		supports := true
+
+		for i, hop := range hops {
+			if hop.FabridEnabled {
+				hasFabrid = true
+			}
+			if len(hop.Policies) > 0 {
+				fallbackIDs[i] = newPolicyIDPtr(hop.Policies[0].Index)
+			}
+
+			required := requiredByISD[hop.IA.ISD()]
+			if len(required) == 0 {
+				continue
+			}
+			if !hop.FabridEnabled {
+				supports = false
+				continue
+			}
+
+			matched := false
+			for _, pol := range hop.Policies {
+				if pol == nil {
+					continue
+				}
+				name := normalizePolicyString(pol.String())
+				for _, need := range required {
+					if name == need {
+						matchedIDs[i] = newPolicyIDPtr(pol.Index)
+						matched = true
+						break
+					}
+				}
+				if matched {
+					break
+				}
+			}
+			if !matched {
+				supports = false
+			}
+		}
+		if !hasFabrid {
+			continue
+		}
+		candidate := &fabridCandidate{
+			path:              p,
+			hops:              hops,
+			supportsPolicy:    supports,
+			matchedPolicyIDs:  matchedIDs,
+			fallbackPolicyIDs: fallbackIDs,
+			fingerprint:       snet.Fingerprint(p),
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates
+}
+
 func chooseBestFabridCandidate(candidates []*fabridCandidate, requireSupport bool) *fabridCandidate {
 	if len(candidates) == 0 {
 		return nil
@@ -834,6 +920,90 @@ func chooseBestFabridCandidate(candidates []*fabridCandidate, requireSupport boo
 		}
 	}
 	return filtered[0]
+}
+
+// buildFabridCandidatesTest33 enforces per-hop requirements for the remote attestation policy:
+//   - local AS hops remain unchecked;
+//   - every intermediate hop must expose L2000 (remote attestation) when possible, otherwise fall back to L1002 (manufacturer C);
+//   - the last hop towards the destination must advertise L2000 (fallback to L1002 is not acceptable).
+//
+// Paths are still considered when some hops only satisfy the fallback policy, but their supportsPolicy flag is set to false,
+// allowing the caller to decide whether to accept a degraded solution.
+func buildFabridCandidatesTest33(paths []snet.Path, localIA, destIA addr.IA) []*fabridCandidate {
+	var candidates []*fabridCandidate
+	for _, p := range paths {
+		if p == nil {
+			continue
+		}
+		meta := p.Metadata()
+		if meta == nil {
+			continue
+		}
+		hops := meta.Hops()
+		if len(hops) == 0 {
+			continue
+		}
+
+		fallbackIDs := make([]*fabrid.PolicyID, len(hops))
+		matchedIDs := make([]*fabrid.PolicyID, len(hops))
+		hasFabrid := false
+		supports := true
+
+		for i, hop := range hops {
+			if hop.FabridEnabled {
+				hasFabrid = true
+			}
+			if len(hop.Policies) > 0 {
+				fallbackIDs[i] = newPolicyIDPtr(hop.Policies[0].Index)
+			}
+
+			// Skip policy enforcement for the local AS hop entirely.
+			if hop.IA == localIA {
+				continue
+			}
+
+			isLastHop := i == len(hops)-1
+			requireRemoteAttestation := isLastHop || hop.IA == destIA
+			var remotePolicy *fabrid.PolicyID
+			var manufacturerCPolicy *fabrid.PolicyID
+
+			for _, pol := range hop.Policies {
+				if pol == nil {
+					continue
+				}
+				switch normalizePolicyString(pol.String()) {
+				case "L2000":
+					remotePolicy = newPolicyIDPtr(pol.Index)
+				case "L1002":
+					manufacturerCPolicy = newPolicyIDPtr(pol.Index)
+				}
+			}
+
+			switch {
+			case remotePolicy != nil:
+				matchedIDs[i] = remotePolicy
+			case !requireRemoteAttestation && manufacturerCPolicy != nil:
+				matchedIDs[i] = manufacturerCPolicy
+				supports = false
+			default:
+				supports = false
+			}
+		}
+
+		if !hasFabrid {
+			continue
+		}
+		candidate := &fabridCandidate{
+			path:              p,
+			hops:              hops,
+			supportsPolicy:    supports,
+			matchedPolicyIDs:  matchedIDs,
+			fallbackPolicyIDs: fallbackIDs,
+			fingerprint:       snet.Fingerprint(p),
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates
 }
 
 func test20(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, hiddenPaths []snet.Path, publicPaths []snet.Path) error {
@@ -1086,21 +1256,27 @@ ALL POSSIBLE POLICIES
 */
 
 // For this test you have to find a FABRID policy that restricts paths to only route over routers that are either manufactured by manufacturer A or manufacturer B.
-func test31(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, publicPaths []snet.Path) error {
+func test31(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA,
+	hiddenPaths []snet.Path, publicPaths []snet.Path) error {
 
 	if daemonConnectorGlobal == nil {
 		return serrors.New("daemon connector is not initialized")
 	}
 
+	allPaths := mergeUniquePaths(hiddenPaths, publicPaths)
+	if len(allPaths) == 0 {
+		return serrors.New("no paths available for FABRID manufacturer policy test")
+	}
+
 	requiredPolicies := []string{"L1000", "L1001"}
-	candidates := buildFabridCandidates(publicPaths, requiredPolicies)
+	candidates := buildFabridCandidates(allPaths, requiredPolicies)
 	supportedCandidate := chooseBestFabridCandidate(candidates, true)
 	fallbackCandidate := supportedCandidate
 	if fallbackCandidate == nil {
 		fallbackCandidate = chooseBestFabridCandidate(candidates, false)
 	}
 
-	selectedPath := publicPaths[0]
+	selectedPath := allPaths[0]
 	if fallbackCandidate != nil {
 		selectedPath = fallbackCandidate.path
 	}
@@ -1215,7 +1391,133 @@ func test31(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 For this test you have to find a FABRID policy that that restricts paths where all routers in ISD 1 are manufactured by manufacturer A and all routers in ISD 2 are manufactured by manufacturer B or C.
 If only one ISD has to be traversed, the policies of the other ISD do not matter.
 */
-func test32(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, publicPaths []snet.Path) error {
+func test32(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA,
+	hiddenPaths []snet.Path, publicPaths []snet.Path) error {
+
+	if daemonConnectorGlobal == nil {
+		return serrors.New("daemon connector is not initialized")
+	}
+	allPaths := mergeUniquePaths(hiddenPaths, publicPaths)
+	if len(allPaths) == 0 {
+		return serrors.New("no paths available for FABRID dual-isd policy test")
+	}
+
+	// buildFabridCandidatesTest32 validates manufacturer policies per ISD and annotates the hops
+	// with the exact FABRID policy IDs that should be enforced.
+	candidates := buildFabridCandidatesTest32(allPaths)
+	supportedCandidate := chooseBestFabridCandidate(candidates, true)
+	fallbackCandidate := supportedCandidate
+	if fallbackCandidate == nil {
+		fallbackCandidate = chooseBestFabridCandidate(candidates, false)
+	}
+
+	selectedPath := allPaths[0]
+	if fallbackCandidate != nil {
+		selectedPath = fallbackCandidate.path
+	}
+	if selectedPath == nil {
+		return serrors.New("unable to select path for FABRID dual-isd policy test")
+	}
+
+	nextHop := selectedPath.UnderlayNextHop()
+	dataplanePath := selectedPath.Dataplane()
+
+	policyFulfilled := supportedCandidate != nil
+	candidateToUse := fallbackCandidate
+
+	var fabridPath *path.FABRID
+	if candidateToUse != nil {
+		scionDataplane, ok := candidateToUse.path.Dataplane().(path.SCION)
+		if !ok {
+			log.Debug("FABRID dual-isd path is not SCION", "type", fmt.Sprintf("%T", candidateToUse.path.Dataplane()))
+			policyFulfilled = false
+		} else {
+			policiesToUse := candidateToUse.fallbackPolicyIDs
+			if supportedCandidate != nil && len(candidateToUse.matchedPolicyIDs) > 0 {
+				policiesToUse = candidateToUse.matchedPolicyIDs
+			}
+			fabridCfg := &path.FabridConfig{
+				LocalIA:         localIAAddr,
+				LocalAddr:       srcIP.String(),
+				DestinationIA:   remote.IA,
+				DestinationAddr: dstIP.String(),
+				ValidationRatio: 128,
+			}
+			fabridCfg.ValidationHandler = func(ps *fabridcommon.PathState, opt *extension.FabridControlOption, success bool) error {
+				if !success {
+					log.Info("FABRID validation reported failure", "stats", ps.Stats, "optionType", opt.Type)
+				} else {
+					log.Debug("FABRID validation succeeded", "stats", ps.Stats)
+				}
+				return nil
+			}
+			p, err := path.NewFABRIDDataplanePath(scionDataplane, candidateToUse.hops, policiesToUse,
+				fabridCfg, daemonConnectorGlobal.FabridKeys)
+			if err != nil {
+				log.Debug("Failed to build FABRID dataplane path for dual-isd policy", "err", err)
+				policyFulfilled = false
+			} else {
+				fabridPath = p
+				dataplanePath = p
+			}
+		}
+	} else {
+		policyFulfilled = false
+	}
+
+	testPayload := lib.Test{
+		ID:      lib.FabridPolicy2Test,
+		Payload: policyFulfilled,
+	}
+	payloadBytes, err := json.Marshal(testPayload)
+	if err != nil {
+		return serrors.WrapStr("encoding FABRID dual-isd policy payload", err)
+	}
+
+	sendPacket := snet.Packet{
+		PacketInfo: snet.PacketInfo{
+			Source: snet.SCIONAddress{
+				IA:   localIAAddr,
+				Host: addr.HostIP(srcIP),
+			},
+			Destination: snet.SCIONAddress{
+				IA:   remote.IA,
+				Host: addr.HostIP(dstIP),
+			},
+			Path:    dataplanePath,
+			Payload: snet.UDPPayload{DstPort: uint16(remote.Host.Port), SrcPort: uint16(sPktConn.LocalAddr().(*net.UDPAddr).Port), Payload: payloadBytes},
+		},
+	}
+	if err := sPktConn.WriteTo(&sendPacket, nextHop); err != nil {
+		return serrors.WrapStr("sending FABRID dual-isd policy result", err)
+	}
+
+	var response snet.Packet
+	var responseUnderlay net.UDPAddr
+	if err := sPktConn.ReadFrom(&response, &responseUnderlay); err != nil {
+		return serrors.WrapStr("reading FABRID dual-isd policy response", err)
+	}
+
+	if fabridPath != nil && response.E2eExtension != nil {
+		for _, opt := range response.E2eExtension.Options {
+			if opt.OptType != slayers.OptTypeFabridControl {
+				continue
+			}
+			controlOption, err := extension.ParseFabridControlOption(opt)
+			if err != nil {
+				return serrors.WrapStr("parsing FABRID control option", err)
+			}
+			if err := fabridPath.HandleFabridControlOption(controlOption, nil); err != nil {
+				return serrors.WrapStr("handling FABRID control option", err)
+			}
+		}
+	}
+
+	if udpPayload, ok := response.Payload.(snet.UDPPayload); ok {
+		log.Debug("FABRID dual-isd policy verifier reply", "payload", string(udpPayload.Payload))
+	} else {
+		log.Debug("FABRID dual-isd policy verifier reply not UDP", "type", fmt.Sprintf("%T", response.Payload))
+	}
 
 	return nil
 }
@@ -1225,7 +1527,137 @@ For this test you have to route over routers that support remote attestation. If
 Additionally, do not enforce any policies for the local AS.
 For each hop (except the special case about local AS and destination AS) it should try to enforce remote attestation, if that particular hop does not support it, enforce produced by manufacturer C for that hop. The last hop to the destination must support remote attestation and for the local AS you don't have to enforce any policy.
 */
-func test33(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, publicPaths []snet.Path) error {
+func test33(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA,
+	hiddenPaths []snet.Path, publicPaths []snet.Path) error {
+
+	if daemonConnectorGlobal == nil {
+		return serrors.New("daemon connector is not initialized")
+	}
+	allPaths := mergeUniquePaths(hiddenPaths, publicPaths)
+	if len(allPaths) == 0 {
+		return serrors.New("no paths available for FABRID attestation policy test")
+	}
+
+	candidates := buildFabridCandidatesTest33(allPaths, localIAAddr, remote.IA)
+	supportedCandidate := chooseBestFabridCandidate(candidates, true)
+	fallbackCandidate := supportedCandidate
+	if fallbackCandidate == nil {
+		fallbackCandidate = chooseBestFabridCandidate(candidates, false)
+	}
+	// At this stage supportedCandidate captures the first path that satisfies the strict policy
+	// (remote attestation everywhere it is required), while fallbackCandidate represents the best
+	// effort option in case no fully compliant path exists.
+
+	selectedPath := allPaths[0]
+	if fallbackCandidate != nil {
+		selectedPath = fallbackCandidate.path
+	}
+	if selectedPath == nil {
+		return serrors.New("unable to select path for FABRID attestation policy test")
+	}
+
+	nextHop := selectedPath.UnderlayNextHop()
+	dataplanePath := selectedPath.Dataplane()
+
+	policyFulfilled := supportedCandidate != nil
+	candidateToUse := fallbackCandidate
+
+	var fabridPath *path.FABRID
+	if candidateToUse != nil {
+		scionDataplane, ok := candidateToUse.path.Dataplane().(path.SCION)
+		if !ok {
+			log.Debug("FABRID attestation path is not SCION", "type", fmt.Sprintf("%T", candidateToUse.path.Dataplane()))
+			policyFulfilled = false
+		} else {
+			policiesToUse := candidateToUse.fallbackPolicyIDs
+			for _, id := range candidateToUse.matchedPolicyIDs {
+				if id != nil {
+					policiesToUse = candidateToUse.matchedPolicyIDs
+					break
+				}
+			}
+			fabridCfg := &path.FabridConfig{
+				LocalIA:         localIAAddr,
+				LocalAddr:       srcIP.String(),
+				DestinationIA:   remote.IA,
+				DestinationAddr: dstIP.String(),
+				ValidationRatio: 128,
+			}
+			fabridCfg.ValidationHandler = func(ps *fabridcommon.PathState, opt *extension.FabridControlOption, success bool) error {
+				if !success {
+					log.Info("FABRID validation reported failure", "stats", ps.Stats, "optionType", opt.Type)
+				} else {
+					log.Debug("FABRID validation succeeded", "stats", ps.Stats)
+				}
+				return nil
+			}
+			p, err := path.NewFABRIDDataplanePath(scionDataplane, candidateToUse.hops, policiesToUse,
+				fabridCfg, daemonConnectorGlobal.FabridKeys)
+			if err != nil {
+				log.Debug("Failed to build FABRID dataplane path for attestation policy", "err", err)
+				policyFulfilled = false
+			} else {
+				fabridPath = p
+				dataplanePath = p
+			}
+		}
+	} else {
+		policyFulfilled = false
+	}
+
+	testPayload := lib.Test{
+		ID:      lib.FabridPolicy3Test,
+		Payload: policyFulfilled,
+	}
+	payloadBytes, err := json.Marshal(testPayload)
+	if err != nil {
+		return serrors.WrapStr("encoding FABRID attestation policy payload", err)
+	}
+
+	sendPacket := snet.Packet{
+		PacketInfo: snet.PacketInfo{
+			Source: snet.SCIONAddress{
+				IA:   localIAAddr,
+				Host: addr.HostIP(srcIP),
+			},
+			Destination: snet.SCIONAddress{
+				IA:   remote.IA,
+				Host: addr.HostIP(dstIP),
+			},
+			Path:    dataplanePath,
+			Payload: snet.UDPPayload{DstPort: uint16(remote.Host.Port), SrcPort: uint16(sPktConn.LocalAddr().(*net.UDPAddr).Port), Payload: payloadBytes},
+		},
+	}
+	if err := sPktConn.WriteTo(&sendPacket, nextHop); err != nil {
+		return serrors.WrapStr("sending FABRID attestation policy result", err)
+	}
+
+	var response snet.Packet
+	var responseUnderlay net.UDPAddr
+	if err := sPktConn.ReadFrom(&response, &responseUnderlay); err != nil {
+		return serrors.WrapStr("reading FABRID attestation policy response", err)
+	}
+
+	if fabridPath != nil && response.E2eExtension != nil {
+		for _, opt := range response.E2eExtension.Options {
+			if opt.OptType != slayers.OptTypeFabridControl {
+				continue
+			}
+			controlOption, err := extension.ParseFabridControlOption(opt)
+			if err != nil {
+				return serrors.WrapStr("parsing FABRID control option", err)
+			}
+			if err := fabridPath.HandleFabridControlOption(controlOption, nil); err != nil {
+				return serrors.WrapStr("handling FABRID control option", err)
+			}
+		}
+	}
+
+	if udpPayload, ok := response.Payload.(snet.UDPPayload); ok {
+		log.Debug("FABRID attestation policy verifier reply", "payload", string(udpPayload.Payload))
+	} else {
+		log.Debug("FABRID attestation policy verifier reply not UDP", "type", fmt.Sprintf("%T", response.Payload))
+	}
 
 	return nil
 }
@@ -1377,15 +1809,15 @@ func realMain() error {
 	if err != nil {
 		return serrors.WrapStr("failed test 30, due to :s", err)
 	}
-	err = test31(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, pathsToVerIA)
+	err = test31(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, hiddenPaths, pathsToVerIA)
 	if err != nil {
 		return serrors.WrapStr("failed test 31, due to :s", err)
 	}
-	err = test32(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, pathsToVerIA)
+	err = test32(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, hiddenPaths, pathsToVerIA)
 	if err != nil {
 		return serrors.WrapStr("failed test 32, due to :s", err)
 	}
-	err = test33(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, pathsToVerIA)
+	err = test33(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, hiddenPaths, pathsToVerIA)
 	if err != nil {
 		return serrors.WrapStr("failed test 33, due to :s", err)
 	}
