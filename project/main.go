@@ -927,8 +927,8 @@ func chooseBestFabridCandidate(candidates []*fabridCandidate, requireSupport boo
 //   - every intermediate hop must expose L2000 (remote attestation) when possible, otherwise fall back to L1002 (manufacturer C);
 //   - the last hop towards the destination must advertise L2000 (fallback to L1002 is not acceptable).
 //
-// Paths are still considered when some hops only satisfy the fallback policy, but their supportsPolicy flag is set to false,
-// allowing the caller to decide whether to accept a degraded solution.
+// Intermediate hops that only offer manufacturer C remain compliant (the topology explicitly allows this),
+// they are therefore marked as supported. Only when no acceptable policy is available is supportsPolicy set to false.
 func buildFabridCandidatesTest33(paths []snet.Path, localIA, destIA addr.IA) []*fabridCandidate {
 	var candidates []*fabridCandidate
 	for _, p := range paths {
@@ -984,7 +984,6 @@ func buildFabridCandidatesTest33(paths []snet.Path, localIA, destIA addr.IA) []*
 				matchedIDs[i] = remotePolicy
 			case !requireRemoteAttestation && manufacturerCPolicy != nil:
 				matchedIDs[i] = manufacturerCPolicy
-				supports = false
 			default:
 				supports = false
 			}
