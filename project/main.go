@@ -1,6 +1,5 @@
 package main
 
-// test comment
 import (
 	"context"
 	"encoding/json"
@@ -36,9 +35,7 @@ var (
 	remote                snet.UDPAddr
 	daemonConnectorGlobal daemon.Connector
 	connGlobal            *snet.Conn
-	ctxGlobal             context.Context
-	currentPaths          []snet.Path
-	currentHiddenPaths    []snet.Path
+	packetConnGlobal      snet.PacketConn
 )
 
 // The port of your SCION daemon.
@@ -65,7 +62,7 @@ func main() {
 	}
 }
 
-func test1(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
+func test1(ctx context.Context, localIAAddr addr.IA) error {
 	conn := connGlobal
 	if conn == nil {
 		return serrors.New("SCION connection not initialized")
@@ -74,7 +71,7 @@ func test1(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		paths []snet.Path
 		err   error
 	)
-	paths, _, err = refreshAllPaths(localIAAddr)
+	paths, _, err = refreshAllPaths(ctx, localIAAddr)
 	if err != nil {
 		return serrors.WrapStr("refreshing paths for test1", err)
 	}
@@ -197,44 +194,18 @@ func ensureNextHopFamily(local *net.UDPAddr, nextHop *net.UDPAddr) error {
 	return nil
 }
 
-func refreshAllPaths(localIAAddr addr.IA) ([]snet.Path, []snet.Path, error) {
-	refreshedPublic, err := daemonConnectorGlobal.Paths(ctxGlobal, remote.IA, localIAAddr, daemon.PathReqFlags{Refresh: true})
+func refreshAllPaths(ctx context.Context, localIAAddr addr.IA) ([]snet.Path, []snet.Path, error) {
+	refreshedPublic, err := daemonConnectorGlobal.Paths(ctx, remote.IA, localIAAddr, daemon.PathReqFlags{Refresh: true})
 	if err != nil {
 		return nil, nil, err
 	}
-	refreshedHidden, err := daemonConnectorGlobal.Paths(ctxGlobal, remote.IA, localIAAddr, daemon.PathReqFlags{Hidden: true, Refresh: true})
+	refreshedHidden, err := daemonConnectorGlobal.Paths(ctx, remote.IA, localIAAddr, daemon.PathReqFlags{Hidden: true, Refresh: true})
 	if err != nil {
 		return nil, nil, err
 	}
 	merged := mergeUniquePaths(refreshedPublic, refreshedHidden)
-	setCurrentPaths(merged)
-	setCurrentHiddenPaths(refreshedHidden)
+
 	return merged, refreshedHidden, nil
-}
-
-func setCurrentPaths(paths []snet.Path) {
-	currentPaths = clonePaths(paths)
-}
-
-func setCurrentHiddenPaths(paths []snet.Path) {
-	currentHiddenPaths = clonePaths(paths)
-}
-
-func getCurrentPaths() []snet.Path {
-	return clonePaths(currentPaths)
-}
-
-func getCurrentHiddenPaths() []snet.Path {
-	return clonePaths(currentHiddenPaths)
-}
-
-func clonePaths(src []snet.Path) []snet.Path {
-	if len(src) == 0 {
-		return nil
-	}
-	dst := make([]snet.Path, len(src))
-	copy(dst, src)
-	return dst
 }
 
 func buildRemoteAddr(base *snet.UDPAddr, path snet.Path) *snet.UDPAddr {
@@ -250,7 +221,7 @@ func buildRemoteAddr(base *snet.UDPAddr, path snet.Path) *snet.UDPAddr {
 	return addr
 }
 
-func test2(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
+func test2(ctx context.Context, localIAAddr addr.IA) error {
 	conn := connGlobal
 	if conn == nil {
 		return serrors.New("SCION connection not initialized")
@@ -272,12 +243,10 @@ func test2(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		return serrors.New("unexpected local address type", "addr", conn.LocalAddr())
 	}
 
-	paths, _, err := refreshAllPaths(localUDPAddr.IA)
+	paths, _, err := refreshAllPaths(ctx, localUDPAddr.IA)
 	if err != nil {
 		return serrors.WrapStr("refreshing paths for multipath test", err)
 	}
-	setCurrentPaths(paths)
-
 	var usablePaths []snet.Path
 	nextPathIndex := 0
 
@@ -286,7 +255,6 @@ func test2(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		if err != nil {
 			return err
 		}
-		setCurrentPaths(paths)
 		usablePaths = pool
 		nextPathIndex = 0
 		return nil
@@ -303,7 +271,7 @@ func test2(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		}
 		refreshed = true
 		log.Debug("Refreshing paths", "reason", reason)
-		refreshedPaths, _, err := refreshAllPaths(localIAAddr)
+		refreshedPaths, _, err := refreshAllPaths(ctx, localIAAddr)
 		if err != nil {
 			return serrors.WrapStr("refreshing paths", err, "reason", reason)
 		}
@@ -501,7 +469,7 @@ func findLeastCarbonIntensityPath(pathsToVer []snet.Path, maxMissingCarbonIntens
 // slice to paths having the lowest number of missing carbon intensity reduction interfaces
 // choose the one with the lowest oevrall sum, which will be the shortest one among the sliced paths
 // send over it
-func test10(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
+func test10(ctx context.Context, localIAAddr addr.IA) error {
 	conn := connGlobal
 	if conn == nil {
 		return serrors.New("SCION connection not initialized")
@@ -510,7 +478,7 @@ func test10(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		paths []snet.Path
 		err   error
 	)
-	paths, _, err = refreshAllPaths(localIAAddr)
+	paths, _, err = refreshAllPaths(ctx, localIAAddr)
 	if err != nil {
 		return serrors.WrapStr("refreshing paths for test10", err)
 	}
@@ -636,7 +604,7 @@ func findShortestPaths(pathsToVer []snet.Path) []snet.Path {
 	return shortestPaths
 }
 
-// TODO change higher bandwidth finding handling this edge case If none of the links of a path have bandwidth configured then it is treated as infinite bandwidth in this Test.
+// TODO change higher bandwidth finding handling this edge case : If none of the links of a path have bandwidth configured then it is treated as infinite bandwidth in this Test.
 func findHigherBandwidthPaths(pathsToVer []snet.Path) []snet.Path {
 
 	var higherBwPaths []snet.Path
@@ -734,7 +702,7 @@ func findHigherBandwidthBoundedLeastLatencyPath(pathsToVer []snet.Path, maxMissi
 
 }
 
-func test11(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
+func test11(ctx context.Context, localIAAddr addr.IA) error {
 	conn := connGlobal
 	if conn == nil {
 		return serrors.New("SCION connection not initialized")
@@ -744,7 +712,7 @@ func test11(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		paths []snet.Path
 		err   error
 	)
-	paths, _, err = refreshAllPaths(localIAAddr)
+	paths, _, err = refreshAllPaths(ctx, localIAAddr)
 	if err != nil {
 		return serrors.WrapStr("refreshing paths for test10", err)
 	}
@@ -763,11 +731,6 @@ func test11(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 	if !ok {
 		return serrors.New("unexpected local address type", "addr", conn.LocalAddr())
 	}
-	pktConn := conn.PacketConn()
-	if pktConn == nil {
-		return serrors.New("packet connection not available")
-	}
-
 	remoteAddr := buildRemoteAddr(&remote, usablePaths[0])
 	if err := ensureNextHopFamily(localUDPAddr.Host, remoteAddr.NextHop); err != nil {
 		return err
@@ -1206,7 +1169,7 @@ func chooseBestFabridCandidate(candidates []*fabridCandidate, requireSupport boo
 	return filtered[0]
 }
 
-func test20(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
+func test20(ctx context.Context, localIAAddr addr.IA) error {
 	conn := connGlobal
 	if conn == nil {
 		return serrors.New("SCION connection not initialized")
@@ -1216,7 +1179,7 @@ func test20(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		hiddenPaths []snet.Path
 		err         error
 	)
-	allPaths, hiddenPaths, err = refreshAllPaths(localIAAddr)
+	allPaths, hiddenPaths, err = refreshAllPaths(ctx, localIAAddr)
 	if err != nil {
 		return serrors.WrapStr("refreshing paths for test20", err)
 	}
@@ -1267,8 +1230,7 @@ func test20(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		if err != nil {
 			return serrors.WrapStr("creating EPIC dataplane path", err)
 		}
-		remoteAddr.Path = epicPath
-
+		remoteAddr.Path = snet.DataplanePath(epicPath)
 	}
 
 	_, err = conn.WriteTo(payloadBytes, remoteAddr)
@@ -1295,7 +1257,7 @@ func test20(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 
 // 30-31-32-33 require to satisfy a FABRID policy specified by the verifier
 
-func test30(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
+func test30(ctx context.Context, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 	conn := connGlobal
 	if conn == nil {
 		return serrors.New("SCION connection not initialized")
@@ -1305,7 +1267,7 @@ func test30(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		err   error
 	)
 
-	paths, _, err = refreshAllPaths(localIAAddr)
+	paths, _, err = refreshAllPaths(ctx, localIAAddr)
 	if err != nil {
 		return serrors.WrapStr("refreshing paths for FABRID connectivity test", err)
 	}
@@ -1382,7 +1344,7 @@ func test30(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 	if err != nil {
 		return serrors.WrapStr("encoding FABRID connectivity payload", err)
 	}
-	remoteAddr := buildRemoteAddr(localUDPAddr, selectedCandidate.path)
+	remoteAddr := buildRemoteAddr(&remote, selectedPath)
 	if err := ensureNextHopFamily(localUDPAddr.Host, nextHop); err != nil {
 		return err
 	}
@@ -1393,12 +1355,34 @@ func test30(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 	if err != nil {
 		return serrors.WrapStr("sending scion msg to verifier", err)
 	}
-	// TODO try to call always conn.readFrom to handle more edge cases, and check if 0 with error "packet is destined to a different host" is returned loop on listening
-
+	if packetConnGlobal == nil {
+		return serrors.New("SCION packet connection not initialized")
+	}
+	if err := packetConnGlobal.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting read deadline", err)
+	}
 	var response snet.Packet
 	var responseUnderlay net.UDPAddr
-	if err := conn.PacketConn().ReadFrom(&response, &responseUnderlay); err != nil {
-		return serrors.WrapStr("reading FABRID connectivity response", err)
+	for {
+		if err := packetConnGlobal.ReadFrom(&response, &responseUnderlay); err != nil {
+			return serrors.WrapStr("reading FABRID connectivity response", err)
+		}
+		udpPayload, ok := response.Payload.(snet.UDPPayload)
+		if !ok {
+			break
+		}
+		if response.Destination.Host.Type() != addr.HostTypeIP {
+			break
+		}
+		destAddrPort := netip.AddrPortFrom(response.Destination.Host.IP(), udpPayload.DstPort)
+		if localUDPAddr.Host == nil {
+			return serrors.New("local UDP address missing host")
+		}
+		if localUDPAddr.IA != response.Destination.IA ||
+			localUDPAddr.Host.AddrPort() != destAddrPort {
+			continue
+		}
+		break
 	}
 
 	if fabridPath != nil && response.E2eExtension != nil {
@@ -1446,7 +1430,7 @@ ALL POSSIBLE POLICIES
 */
 
 // For this test you have to find a FABRID policy that restricts paths to only route over routers that are either manufactured by manufacturer A or manufacturer B.
-func test31(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
+func test31(ctx context.Context, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 
 	if daemonConnectorGlobal == nil {
 		return serrors.New("daemon connector is not initialized")
@@ -1457,7 +1441,7 @@ func test31(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		// hidden []snet.Path
 		err error
 	)
-	paths, _, err = refreshAllPaths(localIAAddr)
+	paths, _, err = refreshAllPaths(ctx, localIAAddr)
 	if err != nil {
 		return serrors.WrapStr("refreshing paths for FABRID connectivity test", err)
 	}
@@ -1553,23 +1537,45 @@ func test31(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		return serrors.WrapStr("encoding FABRID manufacturer policy payload", err)
 	}
 
-	remoteAddr := buildRemoteAddr(localUDPAddr, selectedPath)
+	remoteAddr := buildRemoteAddr(&remote, selectedPath)
 	if err := ensureNextHopFamily(localUDPAddr.Host, nextHop); err != nil {
 		return err
 	}
 	remoteAddr.Path = dataplanePath // TODO check legality of this, if not edit buildRemoteAddr to handle also fabrid/epic paths
 
-	// send crafted packer with write and listen for replies from teh verifier
+	// send crafted packet with write and listen for replies from the verifier
 	_, err = conn.WriteTo(payloadBytes, remoteAddr)
 	if err != nil {
 		return serrors.WrapStr("sending scion msg to verifier", err)
 	}
-	// TODO try to call always conn.readFrom to handle more edge cases, and check if 0 with error "packet is destined to a different host" is returned loop on listening
-
+	if packetConnGlobal == nil {
+		return serrors.New("SCION packet connection not initialized")
+	}
+	if err := packetConnGlobal.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting read deadline", err)
+	}
 	var response snet.Packet
 	var responseUnderlay net.UDPAddr
-	if err := conn.PacketConn().ReadFrom(&response, &responseUnderlay); err != nil {
-		return serrors.WrapStr("reading FABRID connectivity response", err)
+	for {
+		if err := packetConnGlobal.ReadFrom(&response, &responseUnderlay); err != nil {
+			return serrors.WrapStr("reading FABRID connectivity response", err)
+		}
+		udpPayload, ok := response.Payload.(snet.UDPPayload)
+		if !ok {
+			break
+		}
+		if response.Destination.Host.Type() != addr.HostTypeIP {
+			break
+		}
+		destAddrPort := netip.AddrPortFrom(response.Destination.Host.IP(), udpPayload.DstPort)
+		if localUDPAddr.Host == nil {
+			return serrors.New("local UDP address missing host")
+		}
+		if localUDPAddr.IA != response.Destination.IA ||
+			localUDPAddr.Host.AddrPort() != destAddrPort {
+			continue
+		}
+		break
 	}
 
 	if fabridPath != nil && response.E2eExtension != nil {
@@ -1600,7 +1606,7 @@ func test31(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 For this test you have to find a FABRID policy that that restricts paths where all routers in ISD 1 are manufactured by manufacturer A and all routers in ISD 2 are manufactured by manufacturer B or C.
 If only one ISD has to be traversed, the policies of the other ISD do not matter.
 */
-func test32(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
+func test32(ctx context.Context, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 
 	if daemonConnectorGlobal == nil {
 		return serrors.New("daemon connector is not initialized")
@@ -1611,7 +1617,7 @@ func test32(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		// hidden []snet.Path
 		err error
 	)
-	paths, _, err = refreshAllPaths(localIAAddr)
+	paths, _, err = refreshAllPaths(ctx, localIAAddr)
 	if err != nil {
 		return serrors.WrapStr("refreshing paths for FABRID connectivity test", err)
 	}
@@ -1708,7 +1714,7 @@ func test32(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		return serrors.WrapStr("encoding FABRID dual-isd policy payload", err)
 	}
 
-	remoteAddr := buildRemoteAddr(localUDPAddr, selectedPath)
+	remoteAddr := buildRemoteAddr(&remote, selectedPath)
 	if err := ensureNextHopFamily(localUDPAddr.Host, nextHop); err != nil {
 		return err
 	}
@@ -1720,10 +1726,34 @@ func test32(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		return serrors.WrapStr("sending scion msg to verifier", err)
 	}
 
+	if packetConnGlobal == nil {
+		return serrors.New("SCION packet connection not initialized")
+	}
+	if err := packetConnGlobal.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting read deadline", err)
+	}
 	var response snet.Packet
 	var responseUnderlay net.UDPAddr
-	if err := conn.PacketConn().ReadFrom(&response, &responseUnderlay); err != nil {
-		return serrors.WrapStr("reading FABRID connectivity response", err)
+	for {
+		if err := packetConnGlobal.ReadFrom(&response, &responseUnderlay); err != nil {
+			return serrors.WrapStr("reading FABRID connectivity response", err)
+		}
+		udpPayload, ok := response.Payload.(snet.UDPPayload)
+		if !ok {
+			break
+		}
+		if response.Destination.Host.Type() != addr.HostTypeIP {
+			break
+		}
+		if localUDPAddr.Host == nil {
+			return serrors.New("local UDP address missing host")
+		}
+		destAddrPort := netip.AddrPortFrom(response.Destination.Host.IP(), udpPayload.DstPort)
+		if localUDPAddr.IA != response.Destination.IA ||
+			localUDPAddr.Host.AddrPort() != destAddrPort {
+			continue
+		}
+		break
 	}
 
 	if fabridPath != nil && response.E2eExtension != nil {
@@ -1755,7 +1785,7 @@ For this test you have to route over routers that support remote attestation. If
 Additionally, do not enforce any policies for the local AS.
 For each hop (except the special case about local AS and destination AS) it should try to enforce remote attestation, if that particular hop does not support it, enforce produced by manufacturer C for that hop. The last hop to the destination must support remote attestation and for the local AS you don't have to enforce any policy.
 */
-func test33(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
+func test33(ctx context.Context, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 
 	if daemonConnectorGlobal == nil {
 		return serrors.New("daemon connector is not initialized")
@@ -1766,7 +1796,7 @@ func test33(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		// hidden []snet.Path
 		err error
 	)
-	paths, _, err = refreshAllPaths(localIAAddr)
+	paths, _, err = refreshAllPaths(ctx, localIAAddr)
 	if err != nil {
 		return serrors.WrapStr("refreshing paths for FABRID connectivity test", err)
 	}
@@ -1863,7 +1893,7 @@ func test33(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		return serrors.WrapStr("encoding FABRID attestation policy payload", err)
 	}
 
-	remoteAddr := buildRemoteAddr(localUDPAddr, selectedPath)
+	remoteAddr := buildRemoteAddr(&remote, selectedPath)
 	if err := ensureNextHopFamily(localUDPAddr.Host, nextHop); err != nil {
 		return err
 	}
@@ -1875,10 +1905,34 @@ func test33(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 		return serrors.WrapStr("sending scion msg to verifier", err)
 	}
 
+	if packetConnGlobal == nil {
+		return serrors.New("SCION packet connection not initialized")
+	}
+	if err := packetConnGlobal.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting read deadline", err)
+	}
 	var response snet.Packet
 	var responseUnderlay net.UDPAddr
-	if err := conn.PacketConn().ReadFrom(&response, &responseUnderlay); err != nil {
-		return serrors.WrapStr("reading FABRID connectivity response", err)
+	for {
+		if err := packetConnGlobal.ReadFrom(&response, &responseUnderlay); err != nil {
+			return serrors.WrapStr("reading FABRID connectivity response", err)
+		}
+		udpPayload, ok := response.Payload.(snet.UDPPayload)
+		if !ok {
+			break
+		}
+		if response.Destination.Host.Type() != addr.HostTypeIP {
+			break
+		}
+		if localUDPAddr.Host == nil {
+			return serrors.New("local UDP address missing host")
+		}
+		destAddrPort := netip.AddrPortFrom(response.Destination.Host.IP(), udpPayload.DstPort)
+		if localUDPAddr.IA != response.Destination.IA ||
+			localUDPAddr.Host.AddrPort() != destAddrPort {
+			continue
+		}
+		break
 	}
 
 	if fabridPath != nil && response.E2eExtension != nil {
@@ -1908,10 +1962,8 @@ func test33(srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 func realMain() error {
 	// Your code starts here.
 
-	// create ctxGlobal.Context
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	ctxGlobal := ctx
 
 	// create daemon addr - daemon always runs on localhost
 	var daemonAddr string
@@ -1924,7 +1976,7 @@ func realMain() error {
 	}
 	daemonService := daemon.Service{Address: daemonAddr}
 	// connect to daemon
-	daemonConnector, err := daemonService.Connect(ctxGlobal)
+	daemonConnector, err := daemonService.Connect(ctx)
 	if err != nil {
 		return serrors.WrapStr("connecting to daemon", err)
 	}
@@ -1932,7 +1984,7 @@ func realMain() error {
 	defer daemonConnector.Close()
 
 	// get Local IA address
-	localIAAddr, err := daemonConnectorGlobal.LocalIA(ctxGlobal)
+	localIAAddr, err := daemonConnectorGlobal.LocalIA(ctx)
 	if err != nil {
 		return serrors.WrapStr("getting local IA", err)
 	}
@@ -1946,13 +1998,13 @@ func realMain() error {
 	log.Debug("Local IA address", "localIA", localIAAddr)
 	log.Debug("Local address", "localAddr", localAddr)
 
-	pathsToVerIA, err := daemonConnectorGlobal.Paths(ctxGlobal, remote.IA, localIAAddr, daemon.PathReqFlags{Refresh: true})
+	pathsToVerIA, err := daemonConnectorGlobal.Paths(ctx, remote.IA, localIAAddr, daemon.PathReqFlags{Refresh: true})
 	if err != nil {
 		return serrors.WrapStr("getting paths to verifier IA", err)
 	}
 
 	// obtain available hidden paths from daemon for the verifier AS
-	hiddenPaths, err := daemonConnectorGlobal.Paths(ctxGlobal, remote.IA, localIAAddr, daemon.PathReqFlags{Hidden: true})
+	hiddenPaths, err := daemonConnectorGlobal.Paths(ctx, remote.IA, localIAAddr, daemon.PathReqFlags{Hidden: true})
 	if err != nil {
 		return serrors.WrapStr("getting hidden paths from daemon to verifier AS", err)
 	}
@@ -1966,7 +2018,6 @@ func realMain() error {
 		return serrors.New("no paths available to destination")
 	}
 
-	// TODO runtime debugging due to IDE misinterpretation for all paths print type of Bandwidth and Latency values and all their values
 	log.Debug("Public Paths to verifier IA", "count", len(pathsToVerIA))
 	for i, path := range pathsToVerIA {
 		pathMeta := path.Metadata()
@@ -1983,9 +2034,6 @@ func realMain() error {
 		return serrors.New("no unique paths available to verifier IA")
 	}
 
-	setCurrentPaths(uniquePaths)
-	setCurrentHiddenPaths(hiddenPaths)
-
 	// 	for j, bw := range pathMeta.Bandwidth {
 	// 		log.Debug("Bandwidth entry", "pathIndex", i, "entryIndex", j, "value", bw, "valueType", fmt.Sprintf("%T", bw))
 	// 	}
@@ -1997,11 +2045,8 @@ func realMain() error {
 	// 	}
 	// }
 
-	// TODO runtime debugging due to IDE misinterpretation for all paths print type of Bandwidth and Latency valeus and all their values
-
 	// extend remote, with next hop(this AS border router) and one dataplane path
 	// Check if destination is in a remote AS (more than one segment in path indicates crossing AS boundaries)
-	// TODO check if needed now with SCIONPacketConn, instead of just SCIONNetwork
 	isRemoteAS := len(pathsToVerIA) > 0 && pathsToVerIA[0].Source() != pathsToVerIA[0].Destination()
 	if isRemoteAS {
 		// remote.NextHop = pathsToVerIA[0].UnderlayNextHop()
@@ -2018,17 +2063,25 @@ func realMain() error {
 		},
 		Topology: daemonConnectorGlobal,
 	}
-	conn, err := scionNetwork.Dial(ctxGlobal, "udp", localAddr.Host, remote.Copy())
+	packetConn, err := scionNetwork.OpenRaw(ctx, localAddr.Host)
 	if err != nil {
-		return serrors.WrapStr("dialing SCION connection", err)
+		return serrors.WrapStr("opening SCION packet connection", err)
 	}
+	conn, err := snet.NewCookedConn(
+		packetConn,
+		daemonConnectorGlobal,
+		snet.WithReplyPather(scionNetwork.ReplyPather),
+		snet.WithRemote(remote.Copy()),
+	)
+	if err != nil {
+		return serrors.WrapStr("creating SCION connection", err)
+	}
+	packetConnGlobal = packetConn
 	connGlobal = conn
 
 	if err := connGlobal.SetDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
 		return serrors.WrapStr("setting connection deadline", err)
 	}
-
-	log.Debug("opened SCION connection", "local", connGlobal.LocalAddr(), "remote", connGlobal.RemoteAddr())
 
 	srcNetIPAddr, err := netip.ParseAddr(localAddr.Host.IP.String())
 	if err != nil {
@@ -2039,43 +2092,47 @@ func realMain() error {
 		return serrors.WrapStr("parsing remote IP address", err)
 	}
 
-	err = test1(srcNetIPAddr, dstNetIPAddr, localIAAddr)
+	log.Debug("opened SCION connection", "local", connGlobal.LocalAddr(), "remote", connGlobal.RemoteAddr())
+
+	err = test1(ctx, localIAAddr)
 	if err != nil {
 		return serrors.WrapStr("failed test 1, due to : ", err)
 	}
-	err = test2(srcNetIPAddr, dstNetIPAddr, localIAAddr)
+	err = test2(ctx, localIAAddr)
 	if err != nil {
 		return serrors.WrapStr("failed test 2, due to :s", err)
 	}
-	err = test10(srcNetIPAddr, dstNetIPAddr, localIAAddr)
+	err = test10(ctx, localIAAddr)
 	if err != nil {
 		return serrors.WrapStr("failed test 10, due to :s", err)
 	}
-	err = test11(srcNetIPAddr, dstNetIPAddr, localIAAddr)
+	err = test11(ctx, localIAAddr)
 	if err != nil {
 		return serrors.WrapStr("failed test 11, due to :s", err)
 	}
-	err = test20(srcNetIPAddr, dstNetIPAddr, localIAAddr)
+	err = test20(ctx, localIAAddr)
 	if err != nil {
 		return serrors.WrapStr("failed test 20, due to :s", err)
 	}
-	err = test30(srcNetIPAddr, dstNetIPAddr, localIAAddr)
+	err = test30(ctx, srcNetIPAddr, dstNetIPAddr, localIAAddr)
 	if err != nil {
-		return serrors.WrapStr("failed test 20, due to :s", err)
+		return serrors.WrapStr("failed test 30, due to :s", err)
 	}
-	err = test31(srcNetIPAddr, dstNetIPAddr, localIAAddr)
+	err = test31(ctx, srcNetIPAddr, dstNetIPAddr, localIAAddr)
 	if err != nil {
-		return serrors.WrapStr("failed test 20, due to :s", err)
+		return serrors.WrapStr("failed test 31, due to :s", err)
 	}
-	err = test32(srcNetIPAddr, dstNetIPAddr, localIAAddr)
+	err = test32(ctx, srcNetIPAddr, dstNetIPAddr, localIAAddr)
 	if err != nil {
-		return serrors.WrapStr("failed test 20, due to :s", err)
+		return serrors.WrapStr("failed test 32, due to :s", err)
 	}
-	err = test33(srcNetIPAddr, dstNetIPAddr, localIAAddr)
+	err = test33(ctx, srcNetIPAddr, dstNetIPAddr, localIAAddr)
 	if err != nil {
-		return serrors.WrapStr("failed test 20, due to :s", err)
+		return serrors.WrapStr("failed test 33, due to :s", err)
 	}
 	defer connGlobal.Close()
+	defer packetConnGlobal.Close()
+	defer daemonConnectorGlobal.Close()
 
 	return nil
 }
