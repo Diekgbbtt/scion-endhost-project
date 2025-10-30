@@ -20,16 +20,16 @@ arch: "aarch64"
 # 🔵 This file: Ubuntu images
 images:
 # Try to use release-yyyyMMdd image if available. Note that release-yyyyMMdd will be removed after several months.
-- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img"
+- location: "https://cloud-images.ubuntu.com/releases/noble/release-20250805/ubuntu-24.04-server-cloudimg-amd64.img"
   arch: "x86_64"
   digest: "sha256:834af9cd766d1fd86eca156db7dff34c3713fbbc7f5507a3269be2a72d2d1820"
-- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+- location: "https://cloud-images.ubuntu.com/releases/noble/release-20250805/ubuntu-24.04-server-cloudimg-arm64.img"
   arch: "aarch64"
   digest: "sha256:6177a7958f0168e38ca58c13961bdc613d71b9771148add03bc4ad637eb01b8d"
-- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-riscv64.img"
+- location: "https://cloud-images.ubuntu.com/releases/noble/release-20250805/ubuntu-24.04-server-cloudimg-riscv64.img"
   arch: "riscv64"
   digest: "sha256:61f78940554fd26b1856561dd3c6a47293e7a4acd62c59e0f28d17eb429537bb"
-- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-armhf.img"
+- location: "https://cloud-images.ubuntu.com/releases/noble/release-20250805/ubuntu-24.04-server-cloudimg-armhf.img"
   arch: "armv7l"
   digest: "sha256:aa404106793f77cd8264911050c5fb5e2dfea4c49255f3f9ce5e808eaab059fb"
 # CPUs
