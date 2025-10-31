@@ -1,6 +1,5 @@
 package main
 
-// test comment
 import (
 	"context"
 	"encoding/json"
@@ -17,9 +16,11 @@ import (
 	"github.com/scionproto/scion/pkg/experimental/fabrid"
 	fabridcommon "github.com/scionproto/scion/pkg/experimental/fabrid/common"
 	"github.com/scionproto/scion/pkg/log"
+	"github.com/scionproto/scion/pkg/private/common"
 	"github.com/scionproto/scion/pkg/private/serrors"
 	"github.com/scionproto/scion/pkg/slayers"
 	"github.com/scionproto/scion/pkg/slayers/extension"
+	scionpath "github.com/scionproto/scion/pkg/slayers/path/scion"
 	"github.com/scionproto/scion/pkg/snet"
 	"github.com/scionproto/scion/pkg/snet/path"
 
@@ -34,13 +35,25 @@ var local string
 var (
 	remote                snet.UDPAddr
 	daemonConnectorGlobal daemon.Connector
-	currentPaths          []snet.Path
-	currentHiddenPaths    []snet.Path
 )
 
 // The port of your SCION daemon.
 const daemonPort = 30255
 const defaultRWTimeout = 5 * time.Second
+
+func dialVerifier(ctx context.Context, network *snet.SCIONNetwork, listen *net.UDPAddr) (*snet.Conn, error) {
+	if network == nil {
+		return nil, serrors.New("SCION network not initialized")
+	}
+	if listen == nil {
+		return nil, serrors.New("local listen address is nil")
+	}
+	conn, err := network.Dial(ctx, "udp", snet.CopyUDPAddr(listen), remote.Copy())
+	if err != nil {
+		return nil, serrors.WrapStr("dialing SCION connection", err)
+	}
+	return conn, nil
+}
 
 func main() {
 	// DO NOT MODIFY THIS FUNCTION
@@ -62,19 +75,27 @@ func main() {
 	}
 }
 
-func test1(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, refreshPaths func() ([]snet.Path, []snet.Path, error)) error {
+func test1(ctx context.Context, network *snet.SCIONNetwork, localBase *snet.UDPAddr, localIAAddr addr.IA) error {
+	if localBase == nil || localBase.Host == nil {
+		return serrors.New("local address host missing")
+	}
+	packetConn, err := network.OpenRaw(ctx, localBase.Host)
+	if err != nil {
+		return serrors.WrapStr("opening raw packet connection", err)
+	}
+	defer packetConn.Close()
 
+	conn, err := snet.NewCookedConn(packetConn, network.Topology, snet.WithReplyPather(network.ReplyPather), snet.WithRemote(remote.Copy()))
+	if err != nil {
+		return serrors.WrapStr("creating SCION connection", err)
+	}
+	defer conn.Close()
 	var (
 		paths []snet.Path
-		err   error
 	)
-	if refreshPaths != nil {
-		paths, _, err = refreshPaths()
-		if err != nil {
-			return serrors.WrapStr("refreshing paths for test1", err)
-		}
-	} else {
-		paths = getCurrentPaths()
+	paths, _, err = refreshAllPaths(ctx, localIAAddr)
+	if err != nil {
+		return serrors.WrapStr("refreshing paths for test1", err)
 	}
 
 	usablePaths := filterUsablePaths(paths, time.Now())
@@ -83,61 +104,35 @@ func test1(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIA
 	}
 	pathToVer := usablePaths[0]
 
-	// craft SCION datagram payload according to test task
+	localAddr, ok := conn.LocalAddr().(*snet.UDPAddr)
+	if !ok || localAddr.Host == nil {
+		return serrors.New("unexpected local address type", "addr", conn.LocalAddr())
+	}
+
 	payloadBytes := []byte(`{"ID": 1,"Payload": {}}`)
+	remoteAddr := buildRemoteAddr(&remote, pathToVer)
 
-	localUDPAddr, ok := sPktConn.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		return serrors.New("unexpected local address type", "addr", sPktConn.LocalAddr())
-	}
-
-	send_packet := snet.Packet{
-		PacketInfo: snet.PacketInfo{
-			Source: snet.SCIONAddress{
-				IA:   localIAAddr,
-				Host: addr.HostIP(srcIP),
-			},
-			Destination: snet.SCIONAddress{
-				IA:   remote.IA,
-				Host: addr.HostIP(dstIP),
-			},
-			Path:    pathToVer.Dataplane(), // path retrieved from daemon
-			Payload: snet.UDPPayload{DstPort: uint16(remote.Host.Port), SrcPort: uint16(localUDPAddr.Port), Payload: payloadBytes},
-			// spktConn.OpenRaw() opens a socket listening on the specified address, though the dispatcher(daemon) opens a random port
-		},
-	}
-
-	nextHop := pathToVer.UnderlayNextHop()
-	if err := ensureNextHopFamily(localUDPAddr, nextHop); err != nil {
+	if err := ensureNextHopFamily(localAddr.Host, remoteAddr.NextHop); err != nil {
 		return err
 	}
 
-	// send crafted packer with write and listen for replies from teh verifier
-	log.Debug("about to write packet", "SCION datagram", send_packet)
-	err = sPktConn.WriteTo(&send_packet, nextHop)
-	if err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting write deadline", err)
+	}
+	if _, err := conn.WriteTo(payloadBytes, remoteAddr); err != nil {
 		return serrors.WrapStr("sending scion msg to verifier", err)
 	}
 
-	receive_packet := snet.Packet{}
-	var sender_underlay net.UDPAddr
-	err = sPktConn.ReadFrom(&receive_packet, &sender_underlay)
+	buf := make([]byte, common.SupportedMTU)
+	if err := conn.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting read deadline", err)
+	}
+	n, _, err := conn.ReadFrom(buf)
 	if err != nil {
 		return serrors.WrapStr("reading message from connection", err)
 	}
 
-	// Extract payload from received packet
-	var replyPayload []byte
-	if udpPayload, ok := receive_packet.Payload.(snet.UDPPayload); ok {
-		replyPayload = udpPayload.Payload
-		log.Debug("Received UDP payload", "length", len(replyPayload), "data", string(replyPayload))
-	} else {
-		log.Debug("Received non-UDP payload", "type", fmt.Sprintf("%T", receive_packet.Payload))
-		// For non-UDP payloads, we can't easily extract the payload without more complex parsing
-		replyPayload = []byte{}
-	}
-
-	// TODO edit debgu log to printout test execiution result
+	replyPayload := buf[:n]
 	log.Debug("Verifier reply UDPPayload", "payload", string(replyPayload))
 
 	return nil
@@ -200,6 +195,220 @@ func parseAdditionalPacketCount(payload any) (int, error) {
 	return 0, serrors.New("unexpected payload type for multipath test", "payload", payload)
 }
 
+type hopEdge struct {
+	ingress uint16
+	egress  uint16
+}
+
+func hopEdgeSequenceKey(edges []hopEdge) string {
+	if len(edges) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, edge := range edges {
+		if i > 0 {
+			b.WriteByte('|')
+		}
+		b.WriteString(fmt.Sprintf("%d-%d", edge.ingress, edge.egress))
+	}
+	return b.String()
+}
+
+func asSequenceFromMetadata(meta *snet.PathMetadata) []addr.IA {
+	if meta == nil {
+		return nil
+	}
+	var seq []addr.IA
+	for _, iface := range meta.Interfaces {
+		if len(seq) == 0 || seq[len(seq)-1] != iface.IA {
+			seq = append(seq, iface.IA)
+		}
+	}
+	return seq
+}
+
+func scionRawFromDataplane(dp snet.DataplanePath) ([]byte, error) {
+	switch v := dp.(type) {
+	case path.SCION:
+		return v.Raw, nil
+	case *path.SCION:
+		return v.Raw, nil
+	case *path.FABRID:
+		return v.Raw, nil
+	case *path.EPIC:
+		return v.SCION, nil
+	default:
+		return nil, serrors.New("unsupported dataplane path type", "type", fmt.Sprintf("%T", dp))
+	}
+}
+
+func hopEdgesFromDecoded(decoded *scionpath.Decoded) []hopEdge {
+	if decoded == nil {
+		return nil
+	}
+	edges := make([]hopEdge, 0, len(decoded.HopFields))
+	hopIdx := 0
+	for segIdx := 0; segIdx < len(decoded.InfoFields) && hopIdx < len(decoded.HopFields); segIdx++ {
+		info := decoded.InfoFields[segIdx]
+		segLen := int(decoded.PathMeta.SegLen[segIdx])
+		if segLen == 0 {
+			continue
+		}
+		for j := 0; j < segLen && hopIdx < len(decoded.HopFields); j++ {
+			hop := decoded.HopFields[hopIdx]
+			ingress := hop.ConsIngress
+			egress := hop.ConsEgress
+			if !info.ConsDir {
+				ingress, egress = egress, ingress
+			}
+			log.Debug("hop edge decoded", "segment", segIdx, "hopIndex", hopIdx, "consDir", info.ConsDir, "ingress", hop.ConsIngress, "egress", hop.ConsEgress, "computedIngress", ingress, "computedEgress", egress)
+			edges = append(edges, hopEdge{
+				ingress: ingress,
+				egress:  egress,
+			})
+			hopIdx++
+		}
+	}
+	log.Debug("hopEdgesFromDecoded", "segments", len(decoded.InfoFields), "hops", len(decoded.HopFields), "result", edges)
+	return edges
+}
+
+func hopEdgesFromPath(p snet.Path) ([]hopEdge, error) {
+	if p == nil {
+		return nil, serrors.New("nil path")
+	}
+	raw, err := scionRawFromDataplane(p.Dataplane())
+	if err != nil {
+		return nil, err
+	}
+	var decoded scionpath.Decoded
+	if err := decoded.DecodeFromBytes(raw); err != nil {
+		return nil, serrors.WrapStr("decoding dataplane path", err)
+	}
+	return hopEdgesFromDecoded(&decoded), nil
+}
+
+func hopEdgesFromRawPath(raw snet.RawPath) ([]hopEdge, error) {
+	if raw.PathType != scionpath.PathType {
+		return nil, serrors.New("unsupported path type", "type", raw.PathType)
+	}
+	var decoded scionpath.Decoded
+	if err := decoded.DecodeFromBytes(raw.Raw); err != nil {
+		return nil, serrors.WrapStr("decoding raw path", err)
+	}
+	log.Debug("decoded raw path", "numInfo", len(decoded.InfoFields), "numHops", len(decoded.HopFields), "segLens", decoded.PathMeta.SegLen, "currINF", decoded.PathMeta.CurrINF, "currHF", decoded.PathMeta.CurrHF, "rawBytes", raw.Raw)
+	return hopEdgesFromDecoded(&decoded), nil
+}
+
+func reverseHopEdges(edges []hopEdge) []hopEdge {
+	if len(edges) == 0 {
+		return nil
+	}
+	rev := make([]hopEdge, len(edges))
+	for i := range edges {
+		e := edges[len(edges)-1-i]
+		rev[i] = hopEdge{ingress: e.egress, egress: e.ingress}
+	}
+	return rev
+}
+
+func buildHopEdgeMap(paths []snet.Path) map[hopEdge]addr.IA {
+	edgeMap := make(map[hopEdge]addr.IA)
+	for idx, p := range paths {
+		if p == nil {
+			continue
+		}
+		meta := p.Metadata()
+		if meta == nil {
+			continue
+		}
+		hops := meta.Hops()
+		if len(hops) == 0 {
+			continue
+		}
+		log.Debug("mapping path for hop lookup", "pathIndex", idx, "hopCount", len(hops))
+		for _, hop := range hops {
+			ing := uint16(hop.IgIf)
+			eg := uint16(hop.EgIf)
+			ia := hop.IA
+			key := hopEdge{ingress: ing, egress: eg}
+			if _, ok := edgeMap[key]; !ok {
+				edgeMap[key] = ia
+			}
+			rev := hopEdge{ingress: eg, egress: ing}
+			if _, ok := edgeMap[rev]; !ok {
+				edgeMap[rev] = ia
+			}
+			if eg != 0 {
+				zeroIngress := hopEdge{ingress: 0, egress: eg}
+				if _, ok := edgeMap[zeroIngress]; !ok {
+					edgeMap[zeroIngress] = ia
+				}
+				zeroIngressRev := hopEdge{ingress: eg, egress: 0}
+				if _, ok := edgeMap[zeroIngressRev]; !ok {
+					edgeMap[zeroIngressRev] = ia
+				}
+			}
+			if ing != 0 {
+				zeroEgress := hopEdge{ingress: ing, egress: 0}
+				if _, ok := edgeMap[zeroEgress]; !ok {
+					edgeMap[zeroEgress] = ia
+				}
+				zeroEgressRev := hopEdge{ingress: 0, egress: ing}
+				if _, ok := edgeMap[zeroEgressRev]; !ok {
+					edgeMap[zeroEgressRev] = ia
+				}
+			}
+		}
+	}
+	return edgeMap
+}
+
+func buildHopSequenceMap(paths []snet.Path) map[string][]string {
+	seqMap := make(map[string][]string)
+	for idx, p := range paths {
+		if p == nil {
+			continue
+		}
+		meta := p.Metadata()
+		if meta == nil {
+			continue
+		}
+		edges, err := hopEdgesFromPath(p)
+		if err != nil || len(edges) == 0 {
+			continue
+		}
+		asSeq := asSequenceFromMetadata(meta)
+		if len(asSeq) == 0 {
+			continue
+		}
+		key := hopEdgeSequenceKey(edges)
+		if key != "" {
+			if _, ok := seqMap[key]; !ok {
+				seq := make([]string, len(asSeq))
+				for i, ia := range asSeq {
+					seq[i] = ia.String()
+				}
+				seqMap[key] = seq
+				log.Debug("registered edge sequence", "pathIndex", idx, "key", key, "sequence", seq)
+			}
+		}
+		revEdges := reverseHopEdges(edges)
+		revKey := hopEdgeSequenceKey(revEdges)
+		if revKey != "" {
+			if _, ok := seqMap[revKey]; !ok {
+				revSeq := make([]string, len(asSeq))
+				for i := range asSeq {
+					revSeq[len(asSeq)-1-i] = asSeq[i].String()
+				}
+				seqMap[revKey] = revSeq
+				log.Debug("registered reversed edge sequence", "pathIndex", idx, "key", revKey, "sequence", revSeq)
+			}
+		}
+	}
+	return seqMap
+}
+
 var errPathExpired = serrors.New("path expired")
 var errNoUsablePaths = errors.New("no usable paths available")
 
@@ -221,32 +430,42 @@ func ensureNextHopFamily(local *net.UDPAddr, nextHop *net.UDPAddr) error {
 	return nil
 }
 
-func setCurrentPaths(paths []snet.Path) {
-	currentPaths = clonePaths(paths)
+func refreshAllPaths(ctx context.Context, localIAAddr addr.IA) ([]snet.Path, []snet.Path, error) {
+	refreshedPublic, err := daemonConnectorGlobal.Paths(ctx, remote.IA, localIAAddr, daemon.PathReqFlags{Refresh: true})
+	if err != nil {
+		return nil, nil, err
+	}
+	refreshedHidden, err := daemonConnectorGlobal.Paths(ctx, remote.IA, localIAAddr, daemon.PathReqFlags{Hidden: true, Refresh: true})
+	if err != nil {
+		return nil, nil, err
+	}
+	merged := mergeUniquePaths(refreshedPublic, refreshedHidden)
+
+	return merged, refreshedHidden, nil
 }
 
-func setCurrentHiddenPaths(paths []snet.Path) {
-	currentHiddenPaths = clonePaths(paths)
-}
-
-func getCurrentPaths() []snet.Path {
-	return clonePaths(currentPaths)
-}
-
-func getCurrentHiddenPaths() []snet.Path {
-	return clonePaths(currentHiddenPaths)
-}
-
-func clonePaths(src []snet.Path) []snet.Path {
-	if len(src) == 0 {
+func buildRemoteAddr(base *snet.UDPAddr, path snet.Path) *snet.UDPAddr {
+	if base == nil {
 		return nil
 	}
-	dst := make([]snet.Path, len(src))
-	copy(dst, src)
-	return dst
+	addr := base.Copy()
+	if addr.Host == nil {
+		addr.Host = &net.UDPAddr{}
+	}
+	addr.Path = path.Dataplane()
+	addr.NextHop = path.UnderlayNextHop()
+	return addr
 }
 
-func test2(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, refreshPaths func() ([]snet.Path, []snet.Path, error)) error {
+func test2(ctx context.Context, network *snet.SCIONNetwork, localBase *snet.UDPAddr, localIAAddr addr.IA) error {
+	if localBase == nil || localBase.Host == nil {
+		return serrors.New("local address host missing")
+	}
+	conn, err := dialVerifier(ctx, network, localBase.Host)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 
 	// craft SCION datagram payload according to test task
 	payloadBytes := []byte(`{"ID": 2,"Payload": {}}`)
@@ -259,23 +478,15 @@ func test2(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIA
 		return usable, nil
 	}
 
-	localUDPAddr, ok := sPktConn.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		return serrors.New("unexpected local address type", "addr", sPktConn.LocalAddr())
+	localUDPAddr, ok := conn.LocalAddr().(*snet.UDPAddr)
+	if !ok || localUDPAddr.Host == nil {
+		return serrors.New("unexpected local address type", "addr", conn.LocalAddr())
 	}
-	localPort := uint16(localUDPAddr.Port)
 
-	paths, _, err := func() ([]snet.Path, []snet.Path, error) {
-		if refreshPaths != nil {
-			return refreshPaths()
-		}
-		return getCurrentPaths(), getCurrentHiddenPaths(), nil
-	}()
+	paths, _, err := refreshAllPaths(ctx, localUDPAddr.IA)
 	if err != nil {
 		return serrors.WrapStr("refreshing paths for multipath test", err)
 	}
-	setCurrentPaths(paths)
-
 	var usablePaths []snet.Path
 	nextPathIndex := 0
 
@@ -284,7 +495,6 @@ func test2(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIA
 		if err != nil {
 			return err
 		}
-		setCurrentPaths(paths)
 		usablePaths = pool
 		nextPathIndex = 0
 		return nil
@@ -299,12 +509,9 @@ func test2(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIA
 		if refreshed {
 			return serrors.WrapStr("path refresh already attempted", errNoUsablePaths, "reason", reason)
 		}
-		if refreshPaths == nil {
-			return serrors.WrapStr("refresh unavailable", errNoUsablePaths, "reason", reason)
-		}
 		refreshed = true
 		log.Debug("Refreshing paths", "reason", reason)
-		refreshedPaths, _, err := refreshPaths()
+		refreshedPaths, _, err := refreshAllPaths(ctx, localIAAddr)
 		if err != nil {
 			return serrors.WrapStr("refreshing paths", err, "reason", reason)
 		}
@@ -326,29 +533,15 @@ func test2(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIA
 				return errPathExpired
 			}
 		}
-		packet := snet.Packet{
-			PacketInfo: snet.PacketInfo{
-				Source: snet.SCIONAddress{
-					IA:   localIAAddr,
-					Host: addr.HostIP(srcIP),
-				},
-				Destination: snet.SCIONAddress{
-					IA:   remote.IA,
-					Host: addr.HostIP(dstIP),
-				},
-				Path: p.Dataplane(),
-				Payload: snet.UDPPayload{
-					DstPort: uint16(remote.Host.Port),
-					SrcPort: localPort,
-					Payload: payloadBytes,
-				},
-			},
-		}
-		nextHop := p.UnderlayNextHop()
-		if err := ensureNextHopFamily(localUDPAddr, nextHop); err != nil {
+		remoteAddr := buildRemoteAddr(&remote, p)
+		if err := ensureNextHopFamily(localUDPAddr.Host, remoteAddr.NextHop); err != nil {
 			return err
 		}
-		return sPktConn.WriteTo(&packet, nextHop)
+		if err := conn.SetWriteDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+			return serrors.WrapStr("setting write deadline", err)
+		}
+		_, err = conn.WriteTo(payloadBytes, remoteAddr)
+		return err
 	}
 
 	sendNextPath := func(reason string) error {
@@ -375,20 +568,20 @@ func test2(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIA
 	}
 
 	readResult := func() (lib.TestResult, error) {
-		var receivePacket snet.Packet
-		var senderUnderlay net.UDPAddr
-		if err := sPktConn.ReadFrom(&receivePacket, &senderUnderlay); err != nil {
+		buf := make([]byte, common.SupportedMTU)
+		if err := conn.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+			return lib.TestResult{}, serrors.WrapStr("setting read deadline", err)
+		}
+		n, _, err := conn.ReadFrom(buf)
+		if err != nil {
 			return lib.TestResult{}, serrors.WrapStr("reading message from connection", err)
 		}
 
-		udpPayload, ok := receivePacket.Payload.(snet.UDPPayload)
-		if !ok {
-			return lib.TestResult{}, serrors.New("received non-UDP payload from verifier", "payload_type", fmt.Sprintf("%T", receivePacket.Payload))
-		}
-		log.Debug("Parsed reply payload", "payload", string(udpPayload.Payload))
+		replyPayload := buf[:n]
+		log.Debug("Parsed reply payload", "payload", string(replyPayload))
 
 		var result lib.TestResult
-		if err := json.Unmarshal(udpPayload.Payload, &result); err != nil {
+		if err := json.Unmarshal(replyPayload, &result); err != nil {
 			return lib.TestResult{}, serrors.WrapStr("failed to decode verifier reply", err)
 		}
 		return result, nil
@@ -516,19 +709,21 @@ func findLeastCarbonIntensityPath(pathsToVer []snet.Path, maxMissingCarbonIntens
 // slice to paths having the lowest number of missing carbon intensity reduction interfaces
 // choose the one with the lowest oevrall sum, which will be the shortest one among the sliced paths
 // send over it
-func test10(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, refreshPaths func() ([]snet.Path, []snet.Path, error)) error {
-
+func test10(ctx context.Context, network *snet.SCIONNetwork, localBase *snet.UDPAddr, localIAAddr addr.IA) error {
+	if localBase == nil || localBase.Host == nil {
+		return serrors.New("local address host missing")
+	}
+	conn, err := dialVerifier(ctx, network, localBase.Host)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 	var (
 		paths []snet.Path
-		err   error
 	)
-	if refreshPaths != nil {
-		paths, _, err = refreshPaths()
-		if err != nil {
-			return serrors.WrapStr("refreshing paths for test10", err)
-		}
-	} else {
-		paths = getCurrentPaths()
+	paths, _, err = refreshAllPaths(ctx, localIAAddr)
+	if err != nil {
+		return serrors.WrapStr("refreshing paths for test10", err)
 	}
 
 	usablePaths := filterUsablePaths(paths, time.Now())
@@ -546,56 +741,33 @@ func test10(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 
 	payloadBytes := []byte(`{"ID": 10,"Payload": {}}`)
 
-	localUDPAddr, ok := sPktConn.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		return serrors.New("unexpected local address type", "addr", sPktConn.LocalAddr())
+	localUDPAddr, ok := conn.LocalAddr().(*snet.UDPAddr)
+	if !ok || localUDPAddr.Host == nil {
+		return serrors.New("unexpected local address type", "addr", conn.LocalAddr())
 	}
 
-	send_packet := snet.Packet{
-		PacketInfo: snet.PacketInfo{
-			Source: snet.SCIONAddress{
-				IA:   localIAAddr,
-				Host: addr.HostIP(srcIP),
-			},
-			Destination: snet.SCIONAddress{
-				IA:   remote.IA,
-				Host: addr.HostIP(dstIP),
-			},
-			Path:    path.Dataplane(), // path retrieved from daemon
-			Payload: snet.UDPPayload{DstPort: uint16(remote.Host.Port), SrcPort: uint16(localUDPAddr.Port), Payload: payloadBytes},
-			// spktConn.OpenRaw() opens a socket listening on the specified address, though the dispatcher(daemon) opens a random port
-		},
-	}
-
-	nextHop := path.UnderlayNextHop()
-	if err := ensureNextHopFamily(localUDPAddr, nextHop); err != nil {
+	remoteAddr := buildRemoteAddr(&remote, path)
+	if err := ensureNextHopFamily(localUDPAddr.Host, remoteAddr.NextHop); err != nil {
 		return err
 	}
 
-	// send crafted packer with write and listen for replies from teh verifier
-	err = sPktConn.WriteTo(&send_packet, nextHop)
-	if err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting write deadline", err)
+	}
+	if _, err := conn.WriteTo(payloadBytes, remoteAddr); err != nil {
 		return serrors.WrapStr("sending scion msg to verifier", err)
 	}
 
-	receive_packet := snet.Packet{}
-	var sender_underlay net.UDPAddr
-	err = sPktConn.ReadFrom(&receive_packet, &sender_underlay)
+	buf := make([]byte, common.SupportedMTU)
+	if err := conn.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting read deadline", err)
+	}
+	n, _, err := conn.ReadFrom(buf)
 	if err != nil {
 		return serrors.WrapStr("reading message from connection", err)
 	}
 
-	// Extract payload from received packet
-	var replyPayload []byte
-	if udpPayload, ok := receive_packet.Payload.(snet.UDPPayload); ok {
-		replyPayload = udpPayload.Payload
-		log.Debug("Received UDP payload", "length", len(replyPayload), "data", string(replyPayload))
-	} else {
-		log.Debug("Received non-UDP payload", "type", fmt.Sprintf("%T", receive_packet.Payload))
-		// For non-UDP payloads, we can't easily extract the payload without more complex parsing
-		replyPayload = []byte{}
-	}
-
+	replyPayload := buf[:n]
 	log.Debug("Verifier reply UDPPayload", "payload", string(replyPayload))
 
 	return nil
@@ -675,41 +847,76 @@ func findShortestPaths(pathsToVer []snet.Path) []snet.Path {
 	return shortestPaths
 }
 
-// TODO change higher bandwidth finding handling this edge case If none of the links of a path have bandwidth configured then it is treated as infinite bandwidth in this Test.
+// TODO change higher bandwidth finding handling this edge case : If none of the links of a path have bandwidth configured then it is treated as infinite bandwidth in this Test.
 func findHigherBandwidthPaths(pathsToVer []snet.Path) []snet.Path {
-
-	var higherBwPaths []snet.Path
-	var higherBw uint64 = 0
-
-	// First pass: find the maximum minimum (bottleneck) bandwidth among all paths
+	type summary struct {
+		path            snet.Path
+		missingBW       int
+		minConfiguredBW uint64
+		hasConfigured   bool
+	}
+	summaries := make([]summary, 0, len(pathsToVer))
+	minMissing := -1
 	for _, path := range pathsToVer {
-		pathMeta := path.Metadata()
-		var minPathBw uint64 = 0
-		for _, bw := range pathMeta.Bandwidth {
-			if bw != 0 && (minPathBw == 0 || bw < minPathBw) {
-				minPathBw = bw
+		meta := path.Metadata()
+		if meta == nil {
+			continue
+		}
+		missing := 0
+		var minBW uint64
+		hasConfigured := false
+		for _, bw := range meta.Bandwidth {
+			if bw == 0 {
+				missing++
+				continue
+			}
+			if hasConfigured {
+				if bw < minBW {
+					minBW = bw
+				}
+			} else {
+				minBW = bw
+				hasConfigured = true
 			}
 		}
-		if minPathBw > higherBw {
-			higherBw = minPathBw
+		if minMissing == -1 || missing < minMissing {
+			minMissing = missing
 		}
+		summaries = append(summaries, summary{
+			path:            path,
+			missingBW:       missing,
+			minConfiguredBW: minBW,
+			hasConfigured:   hasConfigured,
+		})
 	}
-
-	// Second pass: collect all paths that have this maximum minimum bandwidth
-	for _, path := range pathsToVer {
-		pathMeta := path.Metadata()
-		var minPathBw uint64 = 0
-		for _, bw := range pathMeta.Bandwidth {
-			if bw != 0 && (minPathBw == 0 || bw < minPathBw) {
-				minPathBw = bw
+	var best []snet.Path
+	var bestBW uint64
+	bestBWSet := false
+	for _, s := range summaries {
+		if s.missingBW != minMissing {
+			continue
+		}
+		if !s.hasConfigured {
+			// Treat as infinite bandwidth; prefer immediately.
+			if len(best) == 0 || bestBWSet {
+				best = []snet.Path{s.path}
+				bestBWSet = false
+			} else {
+				best = append(best, s.path)
 			}
+			continue
 		}
-		if minPathBw == higherBw {
-			higherBwPaths = append(higherBwPaths, path)
+		if !bestBWSet || s.minConfiguredBW > bestBW {
+			best = []snet.Path{s.path}
+			bestBW = s.minConfiguredBW
+			bestBWSet = true
+			continue
+		}
+		if bestBWSet && s.minConfiguredBW == bestBW {
+			best = append(best, s.path)
 		}
 	}
-
-	return higherBwPaths
+	return best
 }
 
 func findHigherBandwidthBoundedLeastLatencyPath(pathsToVer []snet.Path, maxMissingLtHops int) (bool, snet.Path) {
@@ -773,19 +980,23 @@ func findHigherBandwidthBoundedLeastLatencyPath(pathsToVer []snet.Path, maxMissi
 
 }
 
-func test11(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, refreshPaths func() ([]snet.Path, []snet.Path, error)) error {
+func test11(ctx context.Context, network *snet.SCIONNetwork, localBase *snet.UDPAddr, localIAAddr addr.IA) error {
+	if localBase == nil || localBase.Host == nil {
+		return serrors.New("local address host missing")
+	}
+	conn, err := dialVerifier(ctx, network, localBase.Host)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 
 	var (
 		paths []snet.Path
-		err   error
 	)
-	if refreshPaths != nil {
-		paths, _, err = refreshPaths()
-		if err != nil {
-			return serrors.WrapStr("refreshing paths for test11", err)
-		}
-	} else {
-		paths = getCurrentPaths()
+	paths, _, err = refreshAllPaths(ctx, localIAAddr)
+
+	if err != nil {
+		return serrors.WrapStr("refreshing paths for test10", err)
 	}
 
 	usablePaths := filterUsablePaths(paths, time.Now())
@@ -798,60 +1009,38 @@ func test11(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 
 	payloadBytes := []byte(`{"ID": 11,"Payload": {}}`)
 
-	localUDPAddr, ok := sPktConn.LocalAddr().(*net.UDPAddr)
+	localUDPAddr, ok := conn.LocalAddr().(*snet.UDPAddr)
 	if !ok {
-		return serrors.New("unexpected local address type", "addr", sPktConn.LocalAddr())
+		return serrors.New("unexpected local address type", "addr", conn.LocalAddr())
 	}
-
-	send_sample_packet := snet.Packet{
-		PacketInfo: snet.PacketInfo{
-			Source: snet.SCIONAddress{
-				IA:   localIAAddr,
-				Host: addr.HostIP(srcIP),
-			},
-			Destination: snet.SCIONAddress{
-				IA:   remote.IA,
-				Host: addr.HostIP(dstIP),
-			},
-			Path:    usablePaths[0].Dataplane(), // path retrieved from daemon
-			Payload: snet.UDPPayload{DstPort: uint16(remote.Host.Port), SrcPort: uint16(localUDPAddr.Port), Payload: payloadBytes},
-			// spktConn.OpenRaw() opens a socket listening on the specified address, though the dispatcher(daemon) opens a random port
-		},
-	}
-
-	nextHop := usablePaths[0].UnderlayNextHop()
-	if err := ensureNextHopFamily(localUDPAddr, nextHop); err != nil {
+	remoteAddr := buildRemoteAddr(&remote, usablePaths[0])
+	if err := ensureNextHopFamily(localUDPAddr.Host, remoteAddr.NextHop); err != nil {
 		return err
 	}
 
-	// send crafted packer with write and listen for replies from teh verifier
-	err = sPktConn.WriteTo(&send_sample_packet, nextHop)
-	if err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting write deadline", err)
+	}
+
+	if _, err := conn.WriteTo(payloadBytes, remoteAddr); err != nil {
 		return serrors.WrapStr("sending scion msg to verifier", err)
 	}
 
-	receive_sample_packet := snet.Packet{}
-	var sample_sender_underlay net.UDPAddr
-	err = sPktConn.ReadFrom(&receive_sample_packet, &sample_sender_underlay)
+	buf := make([]byte, common.SupportedMTU)
+	if err := conn.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting read deadline", err)
+	}
+
+	n, _, err := conn.ReadFrom(buf)
 	if err != nil {
 		return serrors.WrapStr("reading message from connection", err)
 	}
 
-	// Extract payload from received packet
-	var sampleReplyPayload []byte
-	udpPayload, ok := receive_sample_packet.Payload.(snet.UDPPayload)
-	if ok {
-		sampleReplyPayload = udpPayload.Payload
-		log.Debug("Received UDP payload", "length", len(sampleReplyPayload), "data", string(sampleReplyPayload))
-	} else {
-		log.Debug("Received non-UDP payload", "type", fmt.Sprintf("%T", receive_sample_packet.Payload))
-		// For non-UDP payloads, we can't easily extract the payload without more complex parsing
-		sampleReplyPayload = []byte{}
-	}
-	log.Debug("Parsed reply payload", "payload", string(sampleReplyPayload))
+	// Extract UDPPayload payload from received packet
+	sampleReplUDPPayload := buf[:n]
 
 	var testPayload lib.TestResult
-	if err := json.Unmarshal(sampleReplyPayload, &testPayload); err != nil {
+	if err := json.Unmarshal(sampleReplUDPPayload, &testPayload); err != nil {
 		log.Debug("failed to decode verifier reply: %v", err)
 	}
 	// verifier will respond with an integer as payload indicating the maximum latency in milliseconds
@@ -883,50 +1072,29 @@ func test11(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 		maxMisingLtHops++
 	}
 
-	send_packet := snet.Packet{
-		PacketInfo: snet.PacketInfo{
-			Source: snet.SCIONAddress{
-				IA:   localIAAddr,
-				Host: addr.HostIP(srcIP),
-			},
-			Destination: snet.SCIONAddress{
-				IA:   remote.IA,
-				Host: addr.HostIP(dstIP),
-			},
-			Path:    path.Dataplane(), // path retrieved from daemon
-			Payload: snet.UDPPayload{DstPort: uint16(remote.Host.Port), SrcPort: uint16(localUDPAddr.Port), Payload: payloadBytes},
-			// spktConn.OpenRaw() opens a socket listening on the specified address, though the dispatcher(daemon) opens a random port
-		},
-	}
-
-	nextHop = path.UnderlayNextHop()
-	if err := ensureNextHopFamily(localUDPAddr, nextHop); err != nil {
+	remoteAddr = buildRemoteAddr(&remote, path)
+	if err := ensureNextHopFamily(localUDPAddr.Host, remoteAddr.NextHop); err != nil {
 		return err
 	}
 
 	// send crafted packer with write and listen for replies from teh verifier
-	err = sPktConn.WriteTo(&send_packet, nextHop)
+	_, err = conn.WriteTo(payloadBytes, remoteAddr)
 	if err != nil {
 		return serrors.WrapStr("sending scion msg to verifier", err)
 	}
 
-	receive_packet := snet.Packet{}
-	var sender_underlay net.UDPAddr
-	err = sPktConn.ReadFrom(&receive_packet, &sender_underlay)
+	buf = make([]byte, common.SupportedMTU)
+	if err := conn.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting read deadline", err)
+	}
+
+	n, _, err = conn.ReadFrom(buf)
 	if err != nil {
 		return serrors.WrapStr("reading message from connection", err)
 	}
 
 	// Extract payload from received packet
-	var replyPayload []byte
-	if udpPayload, ok := receive_packet.Payload.(snet.UDPPayload); ok {
-		replyPayload = udpPayload.Payload
-		log.Debug("Received UDP payload", "length", len(replyPayload), "data", string(replyPayload))
-	} else {
-		log.Debug("Received non-UDP payload", "type", fmt.Sprintf("%T", receive_packet.Payload))
-		// For non-UDP payloads, we can't easily extract the payload without more complex parsing
-		replyPayload = []byte{}
-	}
+	replyPayload := buf[:n]
 
 	log.Debug("Verifier reply UDPPayload", "payload", string(replyPayload))
 
@@ -1283,21 +1451,22 @@ func chooseBestFabridCandidate(candidates []*fabridCandidate, requireSupport boo
 	return filtered[0]
 }
 
-func test20(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, refreshPaths func() ([]snet.Path, []snet.Path, error)) error {
-
+func test20(ctx context.Context, network *snet.SCIONNetwork, localBase *snet.UDPAddr, localIAAddr addr.IA) error {
+	if localBase == nil || localBase.Host == nil {
+		return serrors.New("local address host missing")
+	}
+	conn, err := dialVerifier(ctx, network, localBase.Host)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 	var (
 		allPaths    []snet.Path
 		hiddenPaths []snet.Path
-		err         error
 	)
-	if refreshPaths != nil {
-		allPaths, hiddenPaths, err = refreshPaths()
-		if err != nil {
-			return serrors.WrapStr("refreshing paths for test20", err)
-		}
-	} else {
-		allPaths = getCurrentPaths()
-		hiddenPaths = getCurrentHiddenPaths()
+	allPaths, hiddenPaths, err = refreshAllPaths(ctx, localIAAddr)
+	if err != nil {
+		return serrors.WrapStr("refreshing paths for test20", err)
 	}
 
 	allUsable := filterUsablePaths(allPaths, time.Now())
@@ -1315,7 +1484,6 @@ func test20(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 	}
 
 	var _path snet.Path
-	var send_packet snet.Packet
 
 	// if more than one find shortest path, lower number of interfaces
 	if len(paths) == 1 {
@@ -1332,9 +1500,13 @@ func test20(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 
 	payloadBytes := []byte(`{"ID": 20,"Payload": {}}`)
 
-	localUDPAddr, ok := sPktConn.LocalAddr().(*net.UDPAddr)
+	localUDPAddr, ok := conn.LocalAddr().(*snet.UDPAddr)
 	if !ok {
-		return serrors.New("unexpected local address type", "addr", sPktConn.LocalAddr())
+		return serrors.New("unexpected local address type", "addr", conn.LocalAddr())
+	}
+	remoteAddr := buildRemoteAddr(&remote, _path)
+	if err := ensureNextHopFamily(localUDPAddr.Host, remoteAddr.NextHop); err != nil {
+		return err
 	}
 
 	if len(hiddenPathsEPIC) != 0 {
@@ -1343,75 +1515,25 @@ func test20(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 		if err != nil {
 			return serrors.WrapStr("creating EPIC dataplane path", err)
 		}
-		send_packet = snet.Packet{
-			PacketInfo: snet.PacketInfo{
-				Source: snet.SCIONAddress{
-					IA:   localIAAddr,
-					Host: addr.HostIP(srcIP),
-				},
-				Destination: snet.SCIONAddress{
-					IA:   remote.IA,
-					Host: addr.HostIP(dstIP),
-				},
-				Path:    epicPath,
-				Payload: snet.UDPPayload{DstPort: uint16(remote.Host.Port), SrcPort: uint16(localUDPAddr.Port), Payload: payloadBytes},
-				// spktConn.OpenRaw() opens a socket listening on the specified address, though the dispatcher(daemon) opens a random port
-			},
-		}
-	} else {
-
-		send_packet = snet.Packet{
-			PacketInfo: snet.PacketInfo{
-				Source: snet.SCIONAddress{
-					IA:   localIAAddr,
-					Host: addr.HostIP(srcIP),
-				},
-				Destination: snet.SCIONAddress{
-					IA:   remote.IA,
-					Host: addr.HostIP(dstIP),
-				},
-				Path:    _path.Dataplane(),
-				Payload: snet.UDPPayload{DstPort: uint16(remote.Host.Port), SrcPort: uint16(localUDPAddr.Port), Payload: payloadBytes},
-				// spktConn.OpenRaw() opens a socket listening on the specified address, though the dispatcher(daemon) opens a random port
-				// check that the type assertion is correct and the value is effectively the port where the daemon is listening
-			},
-		}
+		remoteAddr.Path = snet.DataplanePath(epicPath)
 	}
 
-	log.Debug("sending over", "path", _path)
-	log.Debug("port source in packet", "srcport", localUDPAddr.Port)
-	nextHop := _path.UnderlayNextHop()
-	log.Debug("next hop in the path", "next hop", nextHop)
-	if err := ensureNextHopFamily(localUDPAddr, nextHop); err != nil {
-		return err
-	}
-
-	// send crafted packer with write and listen for replies from teh verifier
-	log.Debug("about to write packet", "SCION datagram", send_packet)
-	err = sPktConn.WriteTo(&send_packet, nextHop)
+	_, err = conn.WriteTo(payloadBytes, remoteAddr)
 	if err != nil {
 		return serrors.WrapStr("sending scion msg to verifier", err)
 	}
-	log.Debug("about to read packet")
-	receive_packet := snet.Packet{}
-	var sender_underlay net.UDPAddr
-	err = sPktConn.ReadFrom(&receive_packet, &sender_underlay)
+
+	buf := make([]byte, common.SupportedMTU)
+	if err := conn.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting read deadline", err)
+	}
+	n, _, err := conn.ReadFrom(buf)
 	if err != nil {
 		return serrors.WrapStr("reading message from connection", err)
 	}
 
-	// Extract payload from received packet
-	var replyPayload []byte
-	if udpPayload, ok := receive_packet.Payload.(snet.UDPPayload); ok {
-		replyPayload = udpPayload.Payload
-		log.Debug("Received UDP payload", "length", len(replyPayload), "data", string(replyPayload))
-	} else {
-		log.Debug("Received non-UDP payload", "type", fmt.Sprintf("%T", receive_packet.Payload))
-		// For non-UDP payloads, we can't easily extract the payload without more complex parsing
-		replyPayload = []byte{}
-	}
+	replyPayload := buf[:n]
 
-	// TODO edit debgu log to printout test execiution result
 	log.Debug("Verifier reply UDPPayload", "payload", string(replyPayload))
 
 	return nil
@@ -1420,30 +1542,39 @@ func test20(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 
 // 30-31-32-33 require to satisfy a FABRID policy specified by the verifier
 
-func test30(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA, refreshPaths func() ([]snet.Path, []snet.Path, error)) error {
-	if daemonConnectorGlobal == nil {
-		return serrors.New("daemon connector is not initialized")
+func test30(ctx context.Context, network *snet.SCIONNetwork, localBase *snet.UDPAddr, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
+	if localBase == nil || localBase.Host == nil {
+		return serrors.New("local address host missing")
 	}
-	var (
-		paths []snet.Path
-		err   error
-	)
-	if refreshPaths != nil {
-		paths, _, err = refreshPaths()
-		if err != nil {
-			return serrors.WrapStr("refreshing paths for FABRID connectivity test", err)
-		}
-	} else {
-		paths = getCurrentPaths()
+	packetConn, err := network.OpenRaw(ctx, localBase.Host)
+	if err != nil {
+		return err
 	}
+
+	log.Debug("UDP socket opened on", "addr", packetConn.LocalAddr(), "to", remote)
+	conn, err := snet.NewCookedConn(packetConn, network.Topology, snet.WithReplyPather(network.ReplyPather), snet.WithRemote(&remote))
+	if err != nil {
+		return err
+	}
+
+	defer packetConn.Close()
+	defer conn.Close()
+
+	var paths []snet.Path
+
+	paths, _, err = refreshAllPaths(ctx, localIAAddr)
+	if err != nil {
+		return serrors.WrapStr("refreshing paths for FABRID connectivity test", err)
+	}
+
 	usablePaths := filterUsablePaths(paths, time.Now())
 	if len(usablePaths) == 0 {
 		return serrors.New("no paths available for FABRID connectivity test")
 	}
 
-	localUDPAddr, ok := sPktConn.LocalAddr().(*net.UDPAddr)
+	localUDPAddr, ok := conn.LocalAddr().(*snet.UDPAddr)
 	if !ok {
-		return serrors.New("unexpected local address type", "addr", sPktConn.LocalAddr())
+		return serrors.New("unexpected local address type", "addr", conn.LocalAddr())
 	}
 
 	candidates := buildFabridCandidates(usablePaths, nil)
@@ -1508,32 +1639,43 @@ func test30(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 	if err != nil {
 		return serrors.WrapStr("encoding FABRID connectivity payload", err)
 	}
-
-	finalPacket := snet.Packet{
-		PacketInfo: snet.PacketInfo{
-			Source: snet.SCIONAddress{
-				IA:   localIAAddr,
-				Host: addr.HostIP(srcIP),
-			},
-			Destination: snet.SCIONAddress{
-				IA:   remote.IA,
-				Host: addr.HostIP(dstIP),
-			},
-			Path:    dataplanePath,
-			Payload: snet.UDPPayload{DstPort: uint16(remote.Host.Port), SrcPort: uint16(localUDPAddr.Port), Payload: payloadBytes},
-		},
-	}
-	if err := ensureNextHopFamily(localUDPAddr, nextHop); err != nil {
+	remoteAddr := buildRemoteAddr(&remote, selectedPath)
+	if err := ensureNextHopFamily(localUDPAddr.Host, nextHop); err != nil {
 		return err
 	}
-	if err := sPktConn.WriteTo(&finalPacket, nextHop); err != nil {
-		return serrors.WrapStr("sending FABRID connectivity result", err)
+	remoteAddr.Path = dataplanePath // TODO check legality of this, if not edit buildRemoteAddr to handle also fabrid/epic paths
+
+	// send crafted packer with write and listen for replies from teh verifier
+	_, err = conn.WriteTo(payloadBytes, remoteAddr)
+	if err != nil {
+		return serrors.WrapStr("sending scion msg to verifier", err)
 	}
 
+	if err := packetConn.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting read deadline", err)
+	}
 	var response snet.Packet
 	var responseUnderlay net.UDPAddr
-	if err := sPktConn.ReadFrom(&response, &responseUnderlay); err != nil {
-		return serrors.WrapStr("reading FABRID connectivity response", err)
+	for {
+		if err := packetConn.ReadFrom(&response, &responseUnderlay); err != nil {
+			return serrors.WrapStr("reading FABRID connectivity response", err)
+		}
+		udpPayload, ok := response.Payload.(snet.UDPPayload)
+		if !ok {
+			break
+		}
+		if response.Destination.Host.Type() != addr.HostTypeIP {
+			break
+		}
+		destAddrPort := netip.AddrPortFrom(response.Destination.Host.IP(), udpPayload.DstPort)
+		if localUDPAddr.Host == nil {
+			return serrors.New("local UDP address missing host")
+		}
+		if localUDPAddr.IA != response.Destination.IA ||
+			localUDPAddr.Host.AddrPort() != destAddrPort {
+			continue
+		}
+		break
 	}
 
 	if fabridPath != nil && response.E2eExtension != nil {
@@ -1581,35 +1723,32 @@ ALL POSSIBLE POLICIES
 */
 
 // For this test you have to find a FABRID policy that restricts paths to only route over routers that are either manufactured by manufacturer A or manufacturer B.
-func test31(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA,
-	refreshPaths func() ([]snet.Path, []snet.Path, error)) error {
+func test31(ctx context.Context, network *snet.SCIONNetwork, localBase *snet.UDPAddr, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 
 	if daemonConnectorGlobal == nil {
 		return serrors.New("daemon connector is not initialized")
 	}
+	if localBase == nil || localBase.Host == nil {
+		return serrors.New("local address host missing")
+	}
 
 	var (
-		paths  []snet.Path
-		hidden []snet.Path
-		err    error
+		paths []snet.Path
+		// hidden []snet.Path
+		err error
 	)
-	if refreshPaths != nil {
-		paths, hidden, err = refreshPaths()
-		if err != nil {
-			return serrors.WrapStr("refreshing paths for FABRID manufacturer policy test", err)
-		}
-	} else {
-		paths = getCurrentPaths()
-		hidden = getCurrentHiddenPaths()
+	paths, _, err = refreshAllPaths(ctx, localIAAddr)
+	if err != nil {
+		return serrors.WrapStr("refreshing paths for FABRID connectivity test", err)
 	}
 
 	usablePaths := filterUsablePaths(paths, time.Now())
-	usableHidden := filterUsablePaths(hidden, time.Now())
-	if len(usablePaths) == 0 && len(usableHidden) == 0 {
+
+	if len(usablePaths) == 0 {
 		return serrors.New("no paths available for FABRID manufacturer policy test")
 	}
 
-	allPaths := mergeUniquePaths(usablePaths, usableHidden)
+	allPaths := mergeUniquePaths(usablePaths, nil)
 	requiredPolicies := []string{"L1000", "L1001"}
 	candidates := buildFabridCandidates(allPaths, requiredPolicies)
 	supportedCandidate := chooseBestFabridCandidate(candidates, true)
@@ -1618,17 +1757,34 @@ func test31(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 		fallbackCandidate = chooseBestFabridCandidate(candidates, false)
 	}
 
-	selectedPath := allPaths[0]
+	packetConn, err := network.OpenRaw(ctx, localBase.Host)
+	if err != nil {
+		return err
+	}
+
+	log.Debug("UDP socket opened on", "addr", packetConn.LocalAddr(), "to", remote)
+	conn, err := snet.NewCookedConn(packetConn, network.Topology, snet.WithReplyPather(network.ReplyPather), snet.WithRemote(&remote))
+	if err != nil {
+		return err
+	}
+
+	defer packetConn.Close()
+	defer conn.Close()
+
+	localUDPAddr, ok := conn.LocalAddr().(*snet.UDPAddr)
+	if !ok {
+		return serrors.New("unexpected local address type", "addr", conn.LocalAddr())
+	}
+	if localUDPAddr.Host == nil {
+		return serrors.New("local address host missing")
+	}
+
+	selectedPath := allPaths[0] //  TODO check if additional precedence algorithm must be used when mutliple paths comply
 	if fallbackCandidate != nil {
 		selectedPath = fallbackCandidate.path
 	}
 	if selectedPath == nil {
 		return serrors.New("unable to select path for FABRID manufacturer policy test")
-	}
-
-	localUDPAddr, ok := sPktConn.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		return serrors.New("unexpected local address type", "addr", sPktConn.LocalAddr())
 	}
 
 	nextHop := selectedPath.UnderlayNextHop()
@@ -1686,31 +1842,46 @@ func test31(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 		return serrors.WrapStr("encoding FABRID manufacturer policy payload", err)
 	}
 
-	sendPacket := snet.Packet{
-		PacketInfo: snet.PacketInfo{
-			Source: snet.SCIONAddress{
-				IA:   localIAAddr,
-				Host: addr.HostIP(srcIP),
-			},
-			Destination: snet.SCIONAddress{
-				IA:   remote.IA,
-				Host: addr.HostIP(dstIP),
-			},
-			Path:    dataplanePath,
-			Payload: snet.UDPPayload{DstPort: uint16(remote.Host.Port), SrcPort: uint16(localUDPAddr.Port), Payload: payloadBytes},
-		},
-	}
-	if err := ensureNextHopFamily(localUDPAddr, nextHop); err != nil {
+	remoteAddr := buildRemoteAddr(&remote, selectedPath)
+	if err := ensureNextHopFamily(localUDPAddr.Host, nextHop); err != nil {
 		return err
 	}
-	if err := sPktConn.WriteTo(&sendPacket, nextHop); err != nil {
-		return serrors.WrapStr("sending FABRID manufacturer policy result", err)
+	remoteAddr.Path = dataplanePath // TODO check legality of this, if not edit buildRemoteAddr to handle also fabrid/epic paths
+
+	// send crafted packet with write and listen for replies from the verifier
+	_, err = conn.WriteTo(payloadBytes, remoteAddr)
+	if err != nil {
+		return serrors.WrapStr("sending scion msg to verifier", err)
 	}
 
+	if packetConn == nil {
+		return serrors.New("SCION packet connection not available")
+	}
+	if err := packetConn.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting read deadline", err)
+	}
 	var response snet.Packet
 	var responseUnderlay net.UDPAddr
-	if err := sPktConn.ReadFrom(&response, &responseUnderlay); err != nil {
-		return serrors.WrapStr("reading FABRID manufacturer policy response", err)
+	for {
+		if err := packetConn.ReadFrom(&response, &responseUnderlay); err != nil {
+			return serrors.WrapStr("reading FABRID connectivity response", err)
+		}
+		udpPayload, ok := response.Payload.(snet.UDPPayload)
+		if !ok {
+			break
+		}
+		if response.Destination.Host.Type() != addr.HostTypeIP {
+			break
+		}
+		destAddrPort := netip.AddrPortFrom(response.Destination.Host.IP(), udpPayload.DstPort)
+		if localUDPAddr.Host == nil {
+			return serrors.New("local UDP address missing host")
+		}
+		if localUDPAddr.IA != response.Destination.IA ||
+			localUDPAddr.Host.AddrPort() != destAddrPort {
+			continue
+		}
+		break
 	}
 
 	if fabridPath != nil && response.E2eExtension != nil {
@@ -1741,36 +1912,32 @@ func test31(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 For this test you have to find a FABRID policy that that restricts paths where all routers in ISD 1 are manufactured by manufacturer A and all routers in ISD 2 are manufactured by manufacturer B or C.
 If only one ISD has to be traversed, the policies of the other ISD do not matter.
 */
-func test32(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA,
-	refreshPaths func() ([]snet.Path, []snet.Path, error)) error {
+func test32(ctx context.Context, network *snet.SCIONNetwork, localBase *snet.UDPAddr, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 
 	if daemonConnectorGlobal == nil {
 		return serrors.New("daemon connector is not initialized")
 	}
+	if localBase == nil || localBase.Host == nil {
+		return serrors.New("local address host missing")
+	}
 
 	var (
-		paths  []snet.Path
-		hidden []snet.Path
-		err    error
+		paths []snet.Path
+		// hidden []snet.Path
+		err error
 	)
-	if refreshPaths != nil {
-		paths, hidden, err = refreshPaths()
-		if err != nil {
-			return serrors.WrapStr("refreshing paths for FABRID dual-isd policy test", err)
-		}
-	} else {
-		paths = getCurrentPaths()
-		hidden = getCurrentHiddenPaths()
+	paths, _, err = refreshAllPaths(ctx, localIAAddr)
+	if err != nil {
+		return serrors.WrapStr("refreshing paths for FABRID connectivity test", err)
 	}
 
 	usablePaths := filterUsablePaths(paths, time.Now())
-	usableHidden := filterUsablePaths(hidden, time.Now())
-	if len(usablePaths) == 0 && len(usableHidden) == 0 {
+
+	if len(usablePaths) == 0 {
 		return serrors.New("no paths available for FABRID dual-isd policy test")
 	}
 
-	allPaths := mergeUniquePaths(usablePaths, usableHidden)
-
+	allPaths := mergeUniquePaths(usablePaths, nil)
 	// buildFabridCandidatesTest32 validates manufacturer policies per ISD and annotates the hops
 	// with the exact FABRID policy IDs that should be enforced.
 	candidates := buildFabridCandidatesTest32(allPaths)
@@ -1780,17 +1947,34 @@ func test32(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 		fallbackCandidate = chooseBestFabridCandidate(candidates, false)
 	}
 
+	packetConn, err := network.OpenRaw(ctx, localBase.Host)
+	if err != nil {
+		return err
+	}
+
+	log.Debug("UDP socket opened on", "addr", packetConn.LocalAddr(), "to", remote)
+	conn, err := snet.NewCookedConn(packetConn, network.Topology, snet.WithReplyPather(network.ReplyPather), snet.WithRemote(&remote))
+	if err != nil {
+		return err
+	}
+
+	defer packetConn.Close()
+	defer conn.Close()
+
+	localUDPAddr, ok := conn.LocalAddr().(*snet.UDPAddr)
+	if !ok {
+		return serrors.New("unexpected local address type", "addr", conn.LocalAddr())
+	}
+	if localUDPAddr.Host == nil {
+		return serrors.New("local address host missing")
+	}
+
 	selectedPath := allPaths[0]
 	if fallbackCandidate != nil {
 		selectedPath = fallbackCandidate.path
 	}
 	if selectedPath == nil {
 		return serrors.New("unable to select path for FABRID dual-isd policy test")
-	}
-
-	localUDPAddr, ok := sPktConn.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		return serrors.New("unexpected local address type", "addr", sPktConn.LocalAddr())
 	}
 
 	nextHop := selectedPath.UnderlayNextHop()
@@ -1848,31 +2032,46 @@ func test32(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 		return serrors.WrapStr("encoding FABRID dual-isd policy payload", err)
 	}
 
-	sendPacket := snet.Packet{
-		PacketInfo: snet.PacketInfo{
-			Source: snet.SCIONAddress{
-				IA:   localIAAddr,
-				Host: addr.HostIP(srcIP),
-			},
-			Destination: snet.SCIONAddress{
-				IA:   remote.IA,
-				Host: addr.HostIP(dstIP),
-			},
-			Path:    dataplanePath,
-			Payload: snet.UDPPayload{DstPort: uint16(remote.Host.Port), SrcPort: uint16(localUDPAddr.Port), Payload: payloadBytes},
-		},
-	}
-	if err := ensureNextHopFamily(localUDPAddr, nextHop); err != nil {
+	remoteAddr := buildRemoteAddr(&remote, selectedPath)
+	if err := ensureNextHopFamily(localUDPAddr.Host, nextHop); err != nil {
 		return err
 	}
-	if err := sPktConn.WriteTo(&sendPacket, nextHop); err != nil {
-		return serrors.WrapStr("sending FABRID dual-isd policy result", err)
+
+	remoteAddr.Path = dataplanePath
+
+	_, err = conn.WriteTo(payloadBytes, remoteAddr)
+	if err != nil {
+		return serrors.WrapStr("sending scion msg to verifier", err)
 	}
 
+	if packetConn == nil {
+		return serrors.New("SCION packet connection not available")
+	}
+	if err := packetConn.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting read deadline", err)
+	}
 	var response snet.Packet
 	var responseUnderlay net.UDPAddr
-	if err := sPktConn.ReadFrom(&response, &responseUnderlay); err != nil {
-		return serrors.WrapStr("reading FABRID dual-isd policy response", err)
+	for {
+		if err := packetConn.ReadFrom(&response, &responseUnderlay); err != nil {
+			return serrors.WrapStr("reading FABRID connectivity response", err)
+		}
+		udpPayload, ok := response.Payload.(snet.UDPPayload)
+		if !ok {
+			break
+		}
+		if response.Destination.Host.Type() != addr.HostTypeIP {
+			break
+		}
+		if localUDPAddr.Host == nil {
+			return serrors.New("local UDP address missing host")
+		}
+		destAddrPort := netip.AddrPortFrom(response.Destination.Host.IP(), udpPayload.DstPort)
+		if localUDPAddr.IA != response.Destination.IA ||
+			localUDPAddr.Host.AddrPort() != destAddrPort {
+			continue
+		}
+		break
 	}
 
 	if fabridPath != nil && response.E2eExtension != nil {
@@ -1904,40 +2103,59 @@ For this test you have to route over routers that support remote attestation. If
 Additionally, do not enforce any policies for the local AS.
 For each hop (except the special case about local AS and destination AS) it should try to enforce remote attestation, if that particular hop does not support it, enforce produced by manufacturer C for that hop. The last hop to the destination must support remote attestation and for the local AS you don't have to enforce any policy.
 */
-func test33(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA,
-	refreshPaths func() ([]snet.Path, []snet.Path, error)) error {
+func test33(ctx context.Context, network *snet.SCIONNetwork, localBase *snet.UDPAddr, srcIP netip.Addr, dstIP netip.Addr, localIAAddr addr.IA) error {
 
 	if daemonConnectorGlobal == nil {
 		return serrors.New("daemon connector is not initialized")
 	}
+	if localBase == nil || localBase.Host == nil {
+		return serrors.New("local address host missing")
+	}
 
 	var (
-		paths  []snet.Path
-		hidden []snet.Path
-		err    error
+		paths []snet.Path
+		// hidden []snet.Path
+		err error
 	)
-	if refreshPaths != nil {
-		paths, hidden, err = refreshPaths()
-		if err != nil {
-			return serrors.WrapStr("refreshing paths for FABRID attestation policy test", err)
-		}
-	} else {
-		paths = getCurrentPaths()
-		hidden = getCurrentHiddenPaths()
+	paths, _, err = refreshAllPaths(ctx, localIAAddr)
+	if err != nil {
+		return serrors.WrapStr("refreshing paths for FABRID connectivity test", err)
 	}
 
 	usablePaths := filterUsablePaths(paths, time.Now())
-	usableHidden := filterUsablePaths(hidden, time.Now())
-	if len(usablePaths) == 0 && len(usableHidden) == 0 {
+
+	if len(usablePaths) == 0 {
 		return serrors.New("no paths available for FABRID attestation policy test")
 	}
 
-	allPaths := mergeUniquePaths(usablePaths, usableHidden)
+	allPaths := mergeUniquePaths(usablePaths, nil)
 	candidates := buildFabridCandidatesTest33(allPaths, localIAAddr, remote.IA)
 	supportedCandidate := chooseBestFabridCandidate(candidates, true)
 	fallbackCandidate := supportedCandidate
 	if fallbackCandidate == nil {
 		fallbackCandidate = chooseBestFabridCandidate(candidates, false)
+	}
+
+	packetConn, err := network.OpenRaw(ctx, localBase.Host)
+	if err != nil {
+		return err
+	}
+
+	log.Debug("UDP socket opened on", "addr", packetConn.LocalAddr(), "to", remote)
+	conn, err := snet.NewCookedConn(packetConn, network.Topology, snet.WithReplyPather(network.ReplyPather), snet.WithRemote(&remote))
+	if err != nil {
+		return err
+	}
+
+	defer packetConn.Close()
+	defer conn.Close()
+
+	localUDPAddr, ok := conn.LocalAddr().(*snet.UDPAddr)
+	if !ok {
+		return serrors.New("unexpected local address type", "addr", conn.LocalAddr())
+	}
+	if localUDPAddr.Host == nil {
+		return serrors.New("local address host missing")
 	}
 
 	selectedPath := allPaths[0]
@@ -1946,11 +2164,6 @@ func test33(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 	}
 	if selectedPath == nil {
 		return serrors.New("unable to select path for FABRID attestation policy test")
-	}
-
-	localUDPAddr, ok := sPktConn.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		return serrors.New("unexpected local address type", "addr", sPktConn.LocalAddr())
 	}
 
 	nextHop := selectedPath.UnderlayNextHop()
@@ -2011,31 +2224,46 @@ func test33(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 		return serrors.WrapStr("encoding FABRID attestation policy payload", err)
 	}
 
-	sendPacket := snet.Packet{
-		PacketInfo: snet.PacketInfo{
-			Source: snet.SCIONAddress{
-				IA:   localIAAddr,
-				Host: addr.HostIP(srcIP),
-			},
-			Destination: snet.SCIONAddress{
-				IA:   remote.IA,
-				Host: addr.HostIP(dstIP),
-			},
-			Path:    dataplanePath,
-			Payload: snet.UDPPayload{DstPort: uint16(remote.Host.Port), SrcPort: uint16(localUDPAddr.Port), Payload: payloadBytes},
-		},
-	}
-	if err := ensureNextHopFamily(localUDPAddr, nextHop); err != nil {
+	remoteAddr := buildRemoteAddr(&remote, selectedPath)
+	if err := ensureNextHopFamily(localUDPAddr.Host, nextHop); err != nil {
 		return err
 	}
-	if err := sPktConn.WriteTo(&sendPacket, nextHop); err != nil {
-		return serrors.WrapStr("sending FABRID attestation policy result", err)
+
+	remoteAddr.Path = dataplanePath
+
+	_, err = conn.WriteTo(payloadBytes, remoteAddr)
+	if err != nil {
+		return serrors.WrapStr("sending scion msg to verifier", err)
 	}
 
+	if packetConn == nil {
+		return serrors.New("SCION packet connection not available")
+	}
+	if err := packetConn.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting read deadline", err)
+	}
 	var response snet.Packet
 	var responseUnderlay net.UDPAddr
-	if err := sPktConn.ReadFrom(&response, &responseUnderlay); err != nil {
-		return serrors.WrapStr("reading FABRID attestation policy response", err)
+	for {
+		if err := packetConn.ReadFrom(&response, &responseUnderlay); err != nil {
+			return serrors.WrapStr("reading FABRID connectivity response", err)
+		}
+		udpPayload, ok := response.Payload.(snet.UDPPayload)
+		if !ok {
+			break
+		}
+		if response.Destination.Host.Type() != addr.HostTypeIP {
+			break
+		}
+		if localUDPAddr.Host == nil {
+			return serrors.New("local UDP address missing host")
+		}
+		destAddrPort := netip.AddrPortFrom(response.Destination.Host.IP(), udpPayload.DstPort)
+		if localUDPAddr.IA != response.Destination.IA ||
+			localUDPAddr.Host.AddrPort() != destAddrPort {
+			continue
+		}
+		break
 	}
 
 	if fabridPath != nil && response.E2eExtension != nil {
@@ -2062,10 +2290,161 @@ func test33(sPktConn snet.PacketConn, srcIP netip.Addr, dstIP netip.Addr, localI
 	return nil
 }
 
+// test40 implements the AS finder test. The verifier expects us to infer the list of ASes a packet
+// traversed based on the hop field sequence contained in its reply. The algorithm is:
+//  1. Establish a raw packet connection to the verifier so we can access full SCION packets.
+//  2. Send an initial Test 40 payload to start the dialogue.
+//  3. For every reply while the test is running:
+//     a. Decode the SCION hop fields to obtain (ingress, egress) pairs per hop.
+//     b. Map each hop to an AS using the precomputed hopLookup map (populated from path metadata).
+//     c. Deduplicate consecutive identical ASes to form the ordered traversal list.
+//     d. Reply to the verifier with that list.
+//  4. Exit successfully when the verifier responds with TestPassed.
+func test40(ctx context.Context, network *snet.SCIONNetwork, localBase *snet.UDPAddr, localIAAddr addr.IA, hopLookup map[hopEdge]addr.IA, seqLookup map[string][]string) error {
+	if network == nil {
+		return serrors.New("SCION network not initialized")
+	}
+	if localBase == nil || localBase.Host == nil {
+		return serrors.New("local address host missing")
+	}
+	packetConn, err := network.OpenRaw(ctx, localBase.Host)
+	if err != nil {
+		return serrors.WrapStr("opening raw packet connection", err)
+	}
+	defer packetConn.Close()
+
+	conn, err := snet.NewCookedConn(packetConn, network.Topology, snet.WithReplyPather(network.ReplyPather), snet.WithRemote(remote.Copy()))
+	if err != nil {
+		return serrors.WrapStr("creating SCION connection", err)
+	}
+	defer conn.Close()
+
+	paths, _, err := refreshAllPaths(ctx, localIAAddr)
+	if err != nil {
+		return serrors.WrapStr("refreshing paths for AS finder test", err)
+	}
+	usablePaths := filterUsablePaths(paths, time.Now())
+	if len(usablePaths) == 0 {
+		return serrors.New("no usable paths available for AS finder test")
+	}
+	selectedPath := usablePaths[0]
+	localUDPAddr, ok := conn.LocalAddr().(*snet.UDPAddr)
+	if !ok || localUDPAddr.Host == nil {
+		return serrors.New("unexpected local address type", "addr", conn.LocalAddr())
+	}
+	remoteAddr := buildRemoteAddr(&remote, selectedPath)
+	if err := ensureNextHopFamily(localUDPAddr.Host, remoteAddr.NextHop); err != nil {
+		return err
+	}
+
+	initial := lib.Test{ID: lib.ASFinderTest, Payload: nil}
+	initialBytes, err := json.Marshal(initial)
+	if err != nil {
+		return serrors.WrapStr("encoding AS finder request", err)
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+		return serrors.WrapStr("setting write deadline", err)
+	}
+	if _, err := conn.WriteTo(initialBytes, remoteAddr); err != nil {
+		return serrors.WrapStr("sending AS finder request", err)
+	}
+
+	for {
+		if err := packetConn.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+			return serrors.WrapStr("setting read deadline", err)
+		}
+		var response snet.Packet
+		var underlay net.UDPAddr
+		if err := packetConn.ReadFrom(&response, &underlay); err != nil {
+			return serrors.WrapStr("reading AS finder response", err)
+		}
+
+		udpPayload, ok := response.Payload.(snet.UDPPayload)
+		if !ok {
+			log.Debug("Ignoring non-UDP payload in AS finder response", "type", fmt.Sprintf("%T", response.Payload))
+			continue
+		}
+		var result lib.TestResult
+		if err := json.Unmarshal(udpPayload.Payload, &result); err != nil {
+			log.Debug("Failed to decode AS finder result", "err", err)
+			continue
+		}
+		if result.ID != lib.ASFinderTest {
+			log.Debug("Ignoring AS finder response with unexpected ID", "id", result.ID)
+			continue
+		}
+		switch result.State {
+		case lib.TestPassed:
+			log.Debug("AS Finder test passed - verifier reply", "ver_reply", string(udpPayload.Payload))
+			return nil
+		case lib.TestFailed:
+			log.Debug("AS finder reported failure payload", "payload", string(udpPayload.Payload))
+			return serrors.New("AS finder test reported failure")
+		case lib.TestRunning:
+			// continue below
+		default:
+			log.Debug("AS finder response with unexpected state", "state", result.State)
+			continue
+		}
+
+		rawPath, ok := response.Path.(snet.RawPath)
+		if !ok {
+			return serrors.New("unexpected path type in AS finder response", "type", fmt.Sprintf("%T", response.Path))
+		}
+		edges, err := hopEdgesFromRawPath(rawPath)
+		if err != nil {
+			return serrors.WrapStr("deriving hop sequence from response", err)
+		}
+		log.Debug("decoded hop edges from verifier", "edges", edges)
+
+		seqKey := hopEdgeSequenceKey(edges)
+		seq := seqLookup[seqKey]
+		if len(seq) == 0 {
+			revKey := hopEdgeSequenceKey(reverseHopEdges(edges))
+			seq = seqLookup[revKey]
+		}
+		if len(seq) == 0 {
+			var tmp []string
+			for _, edge := range edges {
+				ia, ok := hopLookup[edge]
+				if !ok {
+					rev := hopEdge{ingress: edge.egress, egress: edge.ingress}
+					ia, ok = hopLookup[rev]
+				}
+				if !ok {
+					return serrors.New("unable to map hop interface pair to AS",
+						"ingress", edge.ingress, "egress", edge.egress)
+				}
+				iaStr := ia.String()
+				log.Debug("mapped hop to AS via fallback", "ingress", edge.ingress, "egress", edge.egress, "as", iaStr)
+				if len(tmp) == 0 || tmp[len(tmp)-1] != iaStr {
+					tmp = append(tmp, iaStr)
+				}
+			}
+			seq = tmp
+		}
+		if len(seq) == 0 {
+			return serrors.New("derived empty AS sequence from response path")
+		}
+		log.Debug("reply AS sequence", "sequence", seq)
+
+		reply := lib.Test{ID: lib.ASFinderTest, Payload: seq}
+		replyBytes, err := json.Marshal(reply)
+		if err != nil {
+			return serrors.WrapStr("encoding AS finder reply", err)
+		}
+		if err := conn.SetWriteDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
+			return serrors.WrapStr("setting write deadline", err)
+		}
+		if _, err := conn.WriteTo(replyBytes, remoteAddr); err != nil {
+			return serrors.WrapStr("sending AS finder reply", err)
+		}
+	}
+}
+
 func realMain() error {
 	// Your code starts here.
 
-	// create ctx.Context
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -2122,7 +2501,6 @@ func realMain() error {
 		return serrors.New("no paths available to destination")
 	}
 
-	// TODO runtime debugging due to IDE misinterpretation for all paths print type of Bandwidth and Latency values and all their values
 	log.Debug("Public Paths to verifier IA", "count", len(pathsToVerIA))
 	for i, path := range pathsToVerIA {
 		pathMeta := path.Metadata()
@@ -2138,23 +2516,9 @@ func realMain() error {
 	if len(uniquePaths) == 0 {
 		return serrors.New("no unique paths available to verifier IA")
 	}
-	setCurrentPaths(uniquePaths)
-	setCurrentHiddenPaths(hiddenPaths)
 
-	refreshAllPaths := func() ([]snet.Path, []snet.Path, error) {
-		refreshedPublic, err := daemonConnectorGlobal.Paths(ctx, remote.IA, localIAAddr, daemon.PathReqFlags{Refresh: true})
-		if err != nil {
-			return nil, nil, err
-		}
-		refreshedHidden, err := daemonConnectorGlobal.Paths(ctx, remote.IA, localIAAddr, daemon.PathReqFlags{Hidden: true, Refresh: true})
-		if err != nil {
-			return nil, nil, err
-		}
-		merged := mergeUniquePaths(refreshedPublic, refreshedHidden)
-		setCurrentPaths(merged)
-		setCurrentHiddenPaths(refreshedHidden)
-		return merged, refreshedHidden, nil
-	}
+	hopLookup := buildHopEdgeMap(uniquePaths)
+	seqLookup := buildHopSequenceMap(uniquePaths)
 
 	// 	for j, bw := range pathMeta.Bandwidth {
 	// 		log.Debug("Bandwidth entry", "pathIndex", i, "entryIndex", j, "value", bw, "valueType", fmt.Sprintf("%T", bw))
@@ -2167,11 +2531,8 @@ func realMain() error {
 	// 	}
 	// }
 
-	// TODO runtime debugging due to IDE misinterpretation for all paths print type of Bandwidth and Latency valeus and all their values
-
 	// extend remote, with next hop(this AS border router) and one dataplane path
 	// Check if destination is in a remote AS (more than one segment in path indicates crossing AS boundaries)
-	// TODO check if needed now with SCIONPacketConn, instead of just SCIONNetwork
 	isRemoteAS := len(pathsToVerIA) > 0 && pathsToVerIA[0].Source() != pathsToVerIA[0].Destination()
 	if isRemoteAS {
 		// remote.NextHop = pathsToVerIA[0].UnderlayNextHop()
@@ -2181,35 +2542,13 @@ func realMain() error {
 		log.Debug("Same AS communication, no path extension needed")
 	}
 
-	// establish connection with the verifier
+	// establish SCION network context used for per-test connections
 	scionNetwork := &snet.SCIONNetwork{
 		SCMPHandler: snet.DefaultSCMPHandler{
 			RevocationHandler: daemon.RevHandler{Connector: daemonConnectorGlobal},
 		},
 		Topology: daemonConnectorGlobal,
 	}
-
-	spktConn, err := scionNetwork.OpenRaw(ctx, localAddr.Host)
-	if err != nil {
-		return serrors.WrapStr("opening packet connection", err)
-	}
-	if err := spktConn.SetReadDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
-		return serrors.WrapStr("setting read deadline", err)
-	}
-	if err := spktConn.SetWriteDeadline(time.Now().Add(defaultRWTimeout)); err != nil {
-		return serrors.WrapStr("setting write deadline", err)
-	}
-	defer spktConn.Close()
-
-	log.Debug("opened raw conection bound to underlay", "local AS border router", spktConn.LocalAddr)
-
-	// type assertion OpenRaw actually returns a SCIONPacketConn, but signed with PacketConn
-	// TODO use to set more easiliy write and read buffer
-	scionPktConn, ok := spktConn.(*snet.SCIONPacketConn)
-	if !ok {
-		return serrors.New("failed to cast PacketConn to SCIONPacketConn")
-	}
-	defer scionPktConn.Close()
 
 	srcNetIPAddr, err := netip.ParseAddr(localAddr.Host.IP.String())
 	if err != nil {
@@ -2220,41 +2559,35 @@ func realMain() error {
 		return serrors.WrapStr("parsing remote IP address", err)
 	}
 
-	err = test1(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, refreshAllPaths)
-	if err != nil {
+	if err := test1(ctx, scionNetwork, localAddr, localIAAddr); err != nil {
 		return serrors.WrapStr("failed test 1, due to : ", err)
 	}
-	err = test2(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, refreshAllPaths)
-	if err != nil {
+	if err := test2(ctx, scionNetwork, localAddr, localIAAddr); err != nil {
 		return serrors.WrapStr("failed test 2, due to :s", err)
 	}
-	err = test10(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, refreshAllPaths)
-	if err != nil {
+	if err := test10(ctx, scionNetwork, localAddr, localIAAddr); err != nil {
 		return serrors.WrapStr("failed test 10, due to :s", err)
 	}
-	err = test11(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, refreshAllPaths)
-	if err != nil {
+	if err := test11(ctx, scionNetwork, localAddr, localIAAddr); err != nil {
 		return serrors.WrapStr("failed test 11, due to :s", err)
 	}
-	err = test20(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, refreshAllPaths)
-	if err != nil {
+	if err := test20(ctx, scionNetwork, localAddr, localIAAddr); err != nil {
 		return serrors.WrapStr("failed test 20, due to :s", err)
 	}
-	err = test30(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, refreshAllPaths)
-	if err != nil {
-		return serrors.WrapStr("failed test 20, due to :s", err)
+	if err := test30(ctx, scionNetwork, localAddr, srcNetIPAddr, dstNetIPAddr, localIAAddr); err != nil {
+		return serrors.WrapStr("failed test 30, due to :s", err)
 	}
-	err = test31(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, refreshAllPaths)
-	if err != nil {
-		return serrors.WrapStr("failed test 20, due to :s", err)
+	if err := test31(ctx, scionNetwork, localAddr, srcNetIPAddr, dstNetIPAddr, localIAAddr); err != nil {
+		return serrors.WrapStr("failed test 31, due to :s", err)
 	}
-	err = test32(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, refreshAllPaths)
-	if err != nil {
-		return serrors.WrapStr("failed test 20, due to :s", err)
+	if err := test32(ctx, scionNetwork, localAddr, srcNetIPAddr, dstNetIPAddr, localIAAddr); err != nil {
+		return serrors.WrapStr("failed test 32, due to :s", err)
 	}
-	err = test33(spktConn, srcNetIPAddr, dstNetIPAddr, localIAAddr, refreshAllPaths)
-	if err != nil {
-		return serrors.WrapStr("failed test 20, due to :s", err)
+	if err := test33(ctx, scionNetwork, localAddr, srcNetIPAddr, dstNetIPAddr, localIAAddr); err != nil {
+		return serrors.WrapStr("failed test 33, due to :s", err)
+	}
+	if err := test40(ctx, scionNetwork, localAddr, localIAAddr, hopLookup, seqLookup); err != nil {
+		return serrors.WrapStr("failed test 40, due to :s", err)
 	}
 
 	return nil
